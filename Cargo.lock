@@ -1556,7 +1556,7 @@ dependencies = [
  "rand 0.8.4",
  "rayon",
  "regex",
- "rio_api",
+ "rio_api 0.5.3",
  "rio_turtle",
  "rio_xml",
  "rocksdb",
@@ -2080,6 +2080,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fc78f8e9a7f81c2ac5670a0740086e8d61ab9377d07d01ebf65f7ff13bab7e0"
 
 [[package]]
+name = "rio_api"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33d56fef74f659212c3eed41c8d17cfe3f633d482524893736ed6857e8cdbf99"
+
+[[package]]
 name = "rio_turtle"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2087,19 +2093,19 @@ checksum = "b86d09c32fdf8768cb5973be607eb88edabbd6cdfd6d09fd39431e426404b3dc"
 dependencies = [
  "oxilangtag",
  "oxiri",
- "rio_api",
+ "rio_api 0.5.3",
 ]
 
 [[package]]
 name = "rio_xml"
-version = "0.5.3"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "049a0a2e286745b9dd0de80765b1e671917f658429a5790e1c6e2097ccc18539"
+checksum = "2646b30f115ba1e85e5941a6f6a651b245b7b89033a2d92ae0e5646804b388be"
 dependencies = [
  "oxilangtag",
  "oxiri",
  "quick-xml",
- "rio_api",
+ "rio_api 0.6.1",
 ]
 
 [[package]]
