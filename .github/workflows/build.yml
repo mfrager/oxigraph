@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - run: rustup update
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v3
         with:
           python-version: 3.8
       - run: python -m venv python/venv
@@ -72,7 +72,7 @@ jobs:
     needs: python
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v3
         with:
           python-version: 3.6
       - run: pip install 'maturin>=0.11,<0.12'
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - run: rustup update && rustup target add aarch64-apple-darwin
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v3
         with:
           python-version: 3.6
       - run: pip install 'maturin>=0.11,<0.12'
@@ -97,7 +97,7 @@ jobs:
     needs: python
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v3
         with:
           python-version: 3.6
       - run: pip install 'maturin>=0.11,<0.12'
