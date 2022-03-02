@@ -8,7 +8,7 @@ jobs:
   push_server_to_docker_registry:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: docker/metadata-action@v3
         id: docker_meta
         with:
@@ -29,7 +29,7 @@ jobs:
   push_wikibase_to_docker_registry:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: docker/metadata-action@v3
         id: docker_meta
         with:
@@ -50,7 +50,7 @@ jobs:
   publish_lib_crate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: rustup update
       - run: cargo login $CRATES_IO_TOKEN
         env:
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: publish_lib_crate
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: rustup update
       - run: cargo login $CRATES_IO_TOKEN
         env:
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: publish_lib_crate
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: rustup update
       - run: cargo login $CRATES_IO_TOKEN
         env:
@@ -83,7 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: publish_lib_crate
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: sed -i 's/path="..\/lib", //g' python/Cargo.toml
       - run: docker run --rm -v $(pwd):/io konstin2/maturin:v0.11.1 publish -u __token__ -p ${{ secrets.PYPI_PASSWORD }}
         working-directory: ./python
@@ -91,7 +91,7 @@ jobs:
     runs-on: macos-latest
     needs: publish_lib_crate
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: rustup update && rustup target add aarch64-apple-darwin
       - uses: actions/setup-python@v2
         with:
@@ -103,7 +103,7 @@ jobs:
     runs-on: windows-latest
     needs: publish_lib_crate
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions/setup-python@v2
         with:
           python-version: 3.6
@@ -113,7 +113,7 @@ jobs:
   publish_npm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions/setup-node@v2
         with:
           node-version: 14
@@ -131,7 +131,7 @@ jobs:
   publish_python_doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - run: rustup update
       - uses: actions/setup-python@v2
         with:
@@ -144,7 +144,7 @@ jobs:
         working-directory: ./python/docs
       - run: source ../venv/bin/activate && sphinx-build -M html . build
         working-directory: ./python/docs
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           repository: oxigraph/oxigraph.github.io
           path: website
@@ -163,7 +163,7 @@ jobs:
   publish_homebrew:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           repository: oxigraph/homebrew-oxigraph
           token: ${{ secrets.FULL_ACCESS_TOKEN }}
