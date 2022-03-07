@@ -1550,13 +1550,13 @@ dependencies = [
  "native-tls",
  "nom 6.1.2",
  "oxilangtag",
- "oxiri",
+ "oxiri 0.1.1",
  "peg",
  "quick-xml",
  "rand 0.8.4",
  "rayon",
  "regex",
- "rio_api",
+ "rio_api 0.5.3",
  "rio_turtle",
  "rio_xml",
  "rocksdb",
@@ -1589,7 +1589,7 @@ dependencies = [
  "clap",
  "http-types",
  "oxigraph",
- "oxiri",
+ "oxiri 0.1.1",
  "rand 0.8.4",
  "tempfile",
  "url",
@@ -1632,6 +1632,12 @@ name = "oxiri"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8e54fb37480ffa01a9af93f991ba229b3091f2e6ac84c8f6df2c509356cc473"
+
+[[package]]
+name = "oxiri"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8a8821a5332e388ab8d6436ab703c5744516c11976e2c08702fbc93fe4b3f51"
 
 [[package]]
 name = "parking"
@@ -2080,26 +2086,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fc78f8e9a7f81c2ac5670a0740086e8d61ab9377d07d01ebf65f7ff13bab7e0"
 
 [[package]]
+name = "rio_api"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3202105593818d97ca7937eaa646b58d125ac7761d15fe5d8469f0e671521e1f"
+
+[[package]]
 name = "rio_turtle"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b86d09c32fdf8768cb5973be607eb88edabbd6cdfd6d09fd39431e426404b3dc"
 dependencies = [
  "oxilangtag",
- "oxiri",
- "rio_api",
+ "oxiri 0.1.1",
+ "rio_api 0.5.3",
 ]
 
 [[package]]
 name = "rio_xml"
-version = "0.5.3"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "049a0a2e286745b9dd0de80765b1e671917f658429a5790e1c6e2097ccc18539"
+checksum = "48e320dfe5cdbe2b09ddc0e551d6d7abcc64e63d0a95b9ba2f776f762f62e96c"
 dependencies = [
  "oxilangtag",
- "oxiri",
+ "oxiri 0.2.1",
  "quick-xml",
- "rio_api",
+ "rio_api 0.7.0",
 ]
 
 [[package]]
