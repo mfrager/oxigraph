@@ -84,7 +84,7 @@ wasm-bindgen-futures = "0.4.71"
 wkt = "0.14"
 
 # Internal dependencies
-oxigraph = { version = "=0.6.0-dev", path = "lib/oxigraph", default-features = false }
+oxigraph = { version = "=0.6.0-dev", path = "lib/oxigraph", default-features = false, features = ["rocksdb-pkg-config"] }
 oxjsonld = { version = "=0.3.0-dev", path = "lib/oxjsonld" }
 oxrdf = { version = "=0.4.0-dev", path = "lib/oxrdf" }
 oxrdfio = { version = "=0.3.0-dev", path = "lib/oxrdfio" }

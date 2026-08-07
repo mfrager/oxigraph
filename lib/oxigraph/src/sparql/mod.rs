@@ -6,6 +6,7 @@ mod dataset;
 mod error;
 #[cfg(feature = "http-client")]
 mod http;
+pub mod local_service;
 pub mod results;
 mod update;
 
@@ -15,6 +16,7 @@ use crate::sparql::dataset::DatasetView;
 pub use crate::sparql::error::UpdateEvaluationError;
 #[cfg(feature = "http-client")]
 use crate::sparql::http::HttpServiceHandler;
+pub use crate::sparql::local_service::LocalStoreServiceHandler;
 pub use crate::sparql::update::{BoundPreparedSparqlUpdate, PreparedSparqlUpdate};
 use crate::store::{Store, Transaction};
 pub use spareval::{
