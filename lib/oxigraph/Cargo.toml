@@ -74,3 +74,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "store"
 harness = false
 required-features = ["rocksdb"]
+
+[[bench]]
+name = "local_service"
+harness = false
+required-features = ["rocksdb"]

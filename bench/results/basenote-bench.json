@@ -1,0 +1,91 @@
+{
+  "branch": "basenote-bench",
+  "commit": "0a78032f6b8a06c66232c9206b0f80621c8e1657",
+  "timestamp": "2026-08-07T20:30:00Z",
+  "benchmark": "local_service",
+  "description": "Federated join benchmark comparing direct named-graph queries vs SERVICE-based queries using LocalStoreServiceHandler (oxigraph:// URIs). BSBM data partitioned into 3 groups by predicate: G0=rdf:type, G1=rdfs:label+rdfs:comment, G2=everything else.",
+  "methodology": {
+    "direct": "One on-disk RocksDB store with 3 named graphs. Queries use GRAPH <iri> { ... } to join across graphs.",
+    "service": "Two on-disk RocksDB stores (G0, G1) + one in-memory store (G2). Queries use SERVICE <oxigraph://path> { ... } to join across stores. LocalStoreServiceHandler eagerly collects all solutions from each SERVICE sub-query."
+  },
+  "queries": [
+    "2-way: types + labels",
+    "3-way: types + labels + numeric",
+    "star: types + filtered numeric",
+    "optional: types + optional labels + numeric",
+    "wide star: types + labels + 3 numeric props"
+  ],
+  "results": {
+    "N1000": {
+      "data_size_compressed_bytes": 767262,
+      "data_size_uncompressed_approx_bytes": 6200000,
+      "partition_counts": {
+        "G0_types": 5433,
+        "G1_labels": 9860,
+        "G2_other": 12593
+      },
+      "direct_named_graphs": {
+        "time_ms": {
+          "lower": 51.137,
+          "estimate": 52.236,
+          "upper": 53.543
+        },
+        "throughput_mibs": {
+          "lower": 116.62,
+          "estimate": 119.53,
+          "upper": 122.10
+        }
+      },
+      "service_3_stores": {
+        "time_ms": {
+          "lower": 115.53,
+          "estimate": 116.80,
+          "upper": 118.51
+        },
+        "throughput_mibs": {
+          "lower": 52.687,
+          "estimate": 53.460,
+          "upper": 54.046
+        }
+      },
+      "overhead_ratio": 2.24,
+      "correctness": "verified OK"
+    },
+    "N5000": {
+      "data_size_compressed_bytes": 31325006,
+      "data_size_uncompressed_approx_bytes": 396800000,
+      "partition_counts": {
+        "G0_types": 168965,
+        "G1_labels": 30004,
+        "G2_other": 1421351
+      },
+      "direct_named_graphs": {
+        "time_ms": {
+          "lower": 2.9143,
+          "estimate": 2.9548,
+          "upper": 3.0016
+        },
+        "throughput_mibs": {
+          "lower": 129100,
+          "estimate": 131140,
+          "upper": 132960
+        }
+      },
+      "service_3_stores": {
+        "time_s": {
+          "lower": 5.3448,
+          "estimate": 5.3663,
+          "upper": 5.3887
+        },
+        "throughput_mibs": {
+          "lower": 73.635,
+          "estimate": 73.943,
+          "upper": 74.241
+        }
+      },
+      "overhead_ratio": 1820,
+      "correctness": "verified OK",
+      "note": "SERVICE approach is bottlenecked by eager collection of all intermediate solutions (168K types × 30K labels = ~5B join tuples) before LIMIT can be applied. Direct approach pushes LIMIT down into RocksDB."
+    }
+  }
+}
