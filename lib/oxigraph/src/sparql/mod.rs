@@ -12,11 +12,12 @@ mod update;
 
 use crate::model::{IriParseError, NamedNode, Term};
 pub use crate::model::{Variable, VariableNameParseError};
-use crate::sparql::dataset::DatasetView;
+use crate::sparql::dataset::{DatasetView, FusedDataset};
 pub use crate::sparql::error::UpdateEvaluationError;
 #[cfg(feature = "http-client")]
 use crate::sparql::http::HttpServiceHandler;
 pub use crate::sparql::local_service::LocalStoreServiceHandler;
+use crate::sparql::local_service::fuse_query;
 pub use crate::sparql::update::{BoundPreparedSparqlUpdate, PreparedSparqlUpdate};
 use crate::store::{Store, Transaction};
 pub use spareval::{
@@ -68,6 +69,7 @@ pub struct SparqlEvaluator {
     with_http_default_service_handler: bool,
     parser: SparqlParser,
     inner: QueryEvaluator,
+    local_service_handler: Option<LocalStoreServiceHandler>,
 }
 
 impl SparqlEvaluator {
@@ -158,6 +160,39 @@ impl SparqlEvaluator {
         {
             self.with_http_default_service_handler = false;
         }
+        self.inner = self.inner.with_default_service_handler(handler);
+        self
+    }
+
+    /// Use a given [`LocalStoreServiceHandler`] to execute local `SERVICE` calls and fuse
+    /// them into the query plan.
+    ///
+    /// Like [`with_default_service_handler`](Self::with_default_service_handler), but
+    /// additionally enables *fused* execution of `SERVICE <oxigraph://...>` patterns: such
+    /// patterns are rewritten into virtual `GRAPH` patterns evaluated in-process against the
+    /// local stores, which removes the service boundary from evaluation (see the R1 design
+    /// in `planning/service_boundary_design.md`). Stores that cannot be opened keep the
+    /// regular service-handler path (errors and `SILENT` semantics are preserved).
+    ///
+    /// Fusion is skipped (the handler path is kept) for `SERVICE SILENT` calls, SERVICE calls
+    /// whose inner pattern contains `GRAPH` nodes, and queries with `FROM NAMED` clauses, so
+    /// their semantics are always preserved.
+    ///
+    /// Caveats of the fused path:
+    /// - Terms flow between stores by their encoded form, which is a keyless hash of the term
+    ///   string; blank nodes are the only non-portable encoding and may collide with blank
+    ///   nodes of the outer dataset. Avoid fusing stores that contain blank nodes.
+    /// - Local stores are opened (read-only) when the query is bound, even if the SERVICE
+    ///   branch is never executed.
+    ///
+    /// See [`LocalStoreServiceHandler`] for an example.
+    #[inline]
+    pub fn with_local_service_handler(mut self, handler: LocalStoreServiceHandler) -> Self {
+        #[cfg(feature = "http-client")]
+        {
+            self.with_http_default_service_handler = false;
+        }
+        self.local_service_handler = Some(handler.clone());
         self.inner = self.inner.with_default_service_handler(handler);
         self
     }
@@ -409,11 +444,13 @@ impl SparqlEvaluator {
     /// ```
     pub fn for_query(self, query: Query) -> PreparedSparqlQuery {
         let dataset = query.dataset().cloned().map(Into::into).unwrap_or_default();
+        let local_service_handler = self.local_service_handler.clone();
         PreparedSparqlQuery {
             dataset,
             query,
             evaluator: self.into_evaluator(),
             substitutions: HashMap::new(),
+            local_service_handler,
         }
     }
 
@@ -484,6 +521,7 @@ impl Default for SparqlEvaluator {
             with_http_default_service_handler: true,
             parser: SparqlParser::new(),
             inner: QueryEvaluator::new(),
+            local_service_handler: None,
         }
     }
 }
@@ -519,6 +557,7 @@ pub struct PreparedSparqlQuery {
     query: Query,
     dataset: QueryDatasetSpecification,
     substitutions: HashMap<Variable, Term>,
+    local_service_handler: Option<LocalStoreServiceHandler>,
 }
 
 impl PreparedSparqlQuery {
@@ -569,20 +608,48 @@ impl PreparedSparqlQuery {
     }
 
     /// Bind the prepared query to the [`Store`] it should be evaluated on.
-    pub fn on_store(self, store: &Store) -> BoundPreparedSparqlQuery<'static> {
+    pub fn on_store(self, store: &Store) -> BoundPreparedSparqlQuery<'static, FusedDataset<'static>> {
         let reader = store.storage().snapshot();
         let queryable_dataset = DatasetView::new(reader);
-        self.on_queryable_dataset(queryable_dataset)
+        self.bind_local_services(queryable_dataset)
     }
 
     /// Bind the prepared query to the [`Transaction`] it should be evaluated on.
     pub fn on_transaction<'b>(
         self,
         transaction: &'b Transaction<'_>,
-    ) -> BoundPreparedSparqlQuery<'b> {
+    ) -> BoundPreparedSparqlQuery<'b, FusedDataset<'b>> {
         let reader = transaction.inner().reader();
         let dataset = DatasetView::new(reader);
-        self.on_queryable_dataset(dataset)
+        self.bind_local_services(dataset)
+    }
+
+    /// Binds the query to a dataset that fuses local `SERVICE <oxigraph://...>` patterns
+    /// into virtual graphs evaluated in-process against the local stores.
+    ///
+    /// Queries with `FROM NAMED` clauses are not fused: the dataset specification gates named
+    /// graph access, which would make the fused SERVICE return nothing (the handler path is
+    /// independent of the dataset specification and keeps the SERVICE semantics).
+    ///
+    /// Note: the gate checks the *parse-time* query dataset. A `dataset_mut()` call that adds
+    /// `FROM NAMED` after parsing would not disable fusion; in that case the fused `GRAPH`
+    /// simply returns nothing under the applied dataset specification.
+    fn bind_local_services(
+        mut self,
+        queryable_dataset: DatasetView<'_>,
+    ) -> BoundPreparedSparqlQuery<'_, FusedDataset<'_>> {
+        let mut services = Vec::new();
+        let has_from_named = self.query.dataset().is_some_and(|d| d.named.is_some());
+        if let Some(handler) = &self.local_service_handler {
+            if !has_from_named {
+                match fuse_query(self.query.clone(), handler, &queryable_dataset, &mut services) {
+                    Ok(fused_query) => self.query = fused_query,
+                    Err(_) => services.clear(), // Keep the original query: SERVICE nodes use the handler path
+                }
+            }
+        }
+        let fused_dataset = FusedDataset::new(queryable_dataset, services);
+        self.on_queryable_dataset(fused_dataset)
     }
 
     /// Bind the prepared query to the [`QueryableDataset`] it should be evaluated on.

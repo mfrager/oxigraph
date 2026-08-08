@@ -161,6 +161,7 @@ fn run_phase(c: &mut Criterion, data_size: usize) {
     {
         let direct_store = Store::open_read_only(&direct_path).unwrap();
         let handler = LocalStoreServiceHandler::new();
+        let fused_handler = LocalStoreServiceHandler::new();
 
         for (i, (dq, sq)) in direct_queries.iter().zip(&service_queries).enumerate() {
             let dc = count_results(
@@ -173,17 +174,23 @@ fn run_phase(c: &mut Criterion, data_size: usize) {
                 &main_store,
                 sq,
             );
-            if dc != sc {
+            let fc = count_results(
+                &SparqlEvaluator::new().with_local_service_handler(fused_handler.clone()),
+                &main_store,
+                sq,
+            );
+            if dc != sc || dc != fc {
                 eprintln!(
-                    "MISMATCH query {i}: direct={dc} service={sc}"
+                    "MISMATCH query {i}: direct={dc} service={sc} fused={fc}"
                 );
                 eprintln!("  Direct:  {}", dq.to_string().chars().take(300).collect::<String>());
                 eprintln!("  Service: {}", sq.to_string().chars().take(300).collect::<String>());
             }
             assert_eq!(dc, sc, "Result mismatch for query {i} (N={data_size})");
+            assert_eq!(dc, fc, "Fused result mismatch for query {i} (N={data_size})");
         }
     }
-    eprintln!("N={data_size}: correctness verified OK");
+    eprintln!("N={data_size}: correctness verified OK (direct == handler == fused)");
 
     // --- Benchmark ---
     let mut group = c.benchmark_group(format!("local_service N={data_size}"));
@@ -193,14 +200,21 @@ fn run_phase(c: &mut Criterion, data_size: usize) {
     {
         let direct_store = Store::open_read_only(&direct_path).unwrap();
         group.bench_function("direct (named graphs)", |b| {
-            b.iter(|| run_queries(&direct_store, &direct_queries, None))
+            b.iter(|| run_queries(&direct_store, &direct_queries, None, false))
         });
     }
 
     {
         let handler = LocalStoreServiceHandler::new();
         group.bench_function("SERVICE (3 stores)", |b| {
-            b.iter(|| run_queries(&main_store, &service_queries, Some(handler.clone())))
+            b.iter(|| run_queries(&main_store, &service_queries, Some(handler.clone()), false))
+        });
+    }
+
+    {
+        let handler = LocalStoreServiceHandler::new();
+        group.bench_function("SERVICE fused", |b| {
+            b.iter(|| run_queries(&main_store, &service_queries, Some(handler.clone()), true))
         });
     }
 
@@ -379,11 +393,12 @@ fn run_queries(
     store: &Store,
     queries: &[Query],
     handler: Option<LocalStoreServiceHandler>,
+    fused: bool,
 ) {
-    let evaluator = if let Some(h) = handler {
-        SparqlEvaluator::new().with_default_service_handler(h)
-    } else {
-        SparqlEvaluator::new()
+    let evaluator = match handler {
+        Some(h) if fused => SparqlEvaluator::new().with_local_service_handler(h),
+        Some(h) => SparqlEvaluator::new().with_default_service_handler(h),
+        None => SparqlEvaluator::new(),
     };
     for query in queries {
         match evaluator
@@ -447,4 +462,4 @@ criterion_group!(n1000, bench_n1000);
 criterion_group!(n5000, bench_n5000);
 criterion_group!(n25000, bench_n25000);
 criterion_group!(n100000, bench_n100000);
-criterion_main!(n1000, n5000, n25000, n100000);
+criterion_main!(n1000, n5000); // TEMP: n25000/n100000 phases are very slow (and dataset-100000 is not cached); restore for full runs
