@@ -16,8 +16,21 @@ pub enum Command {
         /// Directory in which the data should be persisted
         ///
         /// If not present, an in-memory storage will be used.
-        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        #[arg(short, long, value_hint = ValueHint::DirPath, conflicts_with = "object_store")]
         location: Option<PathBuf>,
+        /// Object store in which the SlateDB database is stored, like `s3://bucket/prefix` or
+        /// `file:///path`
+        ///
+        /// Its presence selects the SlateDB backend. S3 credentials and endpoint are read from the
+        /// AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT and AWS_ALLOW_HTTP
+        /// environment variables. Local databases are usually better opened with --location.
+        #[arg(long, value_name = "URL", conflicts_with = "location")]
+        object_store: Option<String>,
+        /// SlateDB settings file, in TOML, JSON or YAML
+        ///
+        /// Replaces the built-in settings of the SlateDB backend.
+        #[arg(long, value_name = "FILE", requires = "object_store", value_hint = ValueHint::FilePath)]
+        slatedb_config: Option<PathBuf>,
         /// Host and port to listen to
         #[arg(short, long, default_value = "localhost:7878", value_hint = ValueHint::Hostname)]
         bind: String,
@@ -43,8 +56,18 @@ pub enum Command {
     /// Opening as read-only while having another process writing the database is undefined behavior.
     ServeReadOnly {
         /// Directory in which Oxigraph data are persisted
-        #[arg(short, long, value_hint = ValueHint::DirPath)]
-        location: PathBuf,
+        #[arg(short, long, value_hint = ValueHint::DirPath, required_unless_present = "object_store", conflicts_with = "object_store")]
+        location: Option<PathBuf>,
+        /// Object store in which the SlateDB database is stored, like `s3://bucket/prefix` or
+        /// `file:///path`
+        ///
+        /// Its presence selects the SlateDB backend. Opening a database that another process is
+        /// writing is undefined behavior.
+        #[arg(long, value_name = "URL", required_unless_present = "location", conflicts_with = "location")]
+        object_store: Option<String>,
+        /// SlateDB settings file, in TOML, JSON or YAML
+        #[arg(long, value_name = "FILE", requires = "object_store", value_hint = ValueHint::FilePath)]
+        slatedb_config: Option<PathBuf>,
         /// Host and port to listen to
         #[arg(short, long, default_value = "localhost:7878")]
         bind: String,
@@ -77,11 +100,41 @@ pub enum Command {
     /// If you want to move your data to another RDF storage system, you should use the dump operation instead.
     Backup {
         /// Directory in which Oxigraph data are persisted
-        #[arg(short, long, value_hint = ValueHint::DirPath)]
-        location: PathBuf,
+        #[arg(short, long, value_hint = ValueHint::DirPath, required_unless_present = "object_store", conflicts_with = "object_store")]
+        location: Option<PathBuf>,
+        /// Object store in which the SlateDB database is stored, like `s3://bucket/prefix` or
+        /// `file:///path`
+        ///
+        /// Its presence selects the SlateDB backend. A SlateDB backup is a logical copy into the
+        /// destination directory.
+        #[arg(long, value_name = "URL", required_unless_present = "location", conflicts_with = "location")]
+        object_store: Option<String>,
+        /// SlateDB settings file, in TOML, JSON or YAML
+        #[arg(long, value_name = "FILE", requires = "object_store", value_hint = ValueHint::FilePath)]
+        slatedb_config: Option<PathBuf>,
         /// Directory in which the backup will be written
         #[arg(short, long, value_hint = ValueHint::DirPath)]
         destination: PathBuf,
+    },
+    /// Migrate a RocksDB database into a SlateDB one
+    ///
+    /// The source is only read. An interrupted migration resumes where it stopped, unless --restart
+    /// is given. When the copy is over, the target is reopened and compared quad by quad with the
+    /// source.
+    Migrate {
+        /// Directory of the RocksDB database to migrate
+        #[arg(short, long, value_hint = ValueHint::DirPath)]
+        source: PathBuf,
+        /// Object store in which the SlateDB database will be created, like `s3://bucket/prefix` or
+        /// `file:///path`
+        #[arg(long, value_name = "URL", value_hint = ValueHint::Url)]
+        object_store: String,
+        /// SlateDB settings file, in TOML, JSON or YAML
+        #[arg(long, value_name = "FILE", value_hint = ValueHint::FilePath)]
+        slatedb_config: Option<PathBuf>,
+        /// Copies the source again from the beginning instead of resuming an interrupted migration
+        #[arg(long)]
+        restart: bool,
     },
     /// Load file(s) into the store
     ///
@@ -90,8 +143,17 @@ pub enum Command {
     /// Files are loaded atomically, either the file is fully loaded into the store or not at all.
     Load {
         /// Directory in which Oxigraph data are persisted
-        #[arg(short, long, value_hint = ValueHint::DirPath)]
-        location: PathBuf,
+        #[arg(short, long, value_hint = ValueHint::DirPath, required_unless_present = "object_store", conflicts_with = "object_store")]
+        location: Option<PathBuf>,
+        /// Object store in which the SlateDB database is stored, like `s3://bucket/prefix` or
+        /// `file:///path`
+        ///
+        /// Its presence selects the SlateDB backend.
+        #[arg(long, value_name = "URL", required_unless_present = "location", conflicts_with = "location")]
+        object_store: Option<String>,
+        /// SlateDB settings file, in TOML, JSON or YAML
+        #[arg(long, value_name = "FILE", requires = "object_store", value_hint = ValueHint::FilePath)]
+        slatedb_config: Option<PathBuf>,
         /// File(s) to load
         ///
         /// If multiple files are provided, they are loaded in parallel.

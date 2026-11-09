@@ -16,6 +16,9 @@ rust-version.workspace = true
 [features]
 default = ["rocksdb"]
 rocksdb = ["oxrocksdb-sys"]
+# The SlateDB backend, enabled independently of `rocksdb`. Both may be enabled at once.
+# See planning/slatedb/implementation_plan2.md, phase 1.
+slatedb = ["dep:slatedb", "dep:tokio", "dep:url"]
 js = ["getrandom/wasm_js", "oxsdatatypes/js", "js-sys"]
 http-client = ["oxhttp"]
 http-client-native-tls = ["http-client", "oxhttp/native-tls"]
@@ -48,6 +51,19 @@ thiserror.workspace = true
 libc.workspace = true
 oxhttp = { workspace = true, optional = true }
 oxrocksdb-sys = { workspace = true, optional = true }
+# SlateDB is async; the storage layer is sync, so `storage/slatedb_bridge.rs` owns a small
+# dedicated Tokio runtime. `default-features = false` drops the Azure and GCS object stores and the
+# `foyer` block cache; `aws` keeps the S3 one, which `SlateDbOptions::at_url` needs.
+slatedb = { version = "0.18", optional = true, default-features = false, features = [
+  "aws",
+  "lz4",
+] }
+url = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = [
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 getrandom.workspace = true
@@ -74,6 +90,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "store"
 harness = false
 required-features = ["rocksdb"]
+
+[[bench]]
+name = "store_slatedb"
+harness = false
+required-features = ["slatedb"]
 
 [[bench]]
 name = "local_service"

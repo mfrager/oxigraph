@@ -34,6 +34,14 @@
 //! ```
 use crate::io::{RdfParseError, RdfParser, RdfSerializer};
 use crate::model::*;
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+pub use crate::storage::{SlateDbDurability, SlateDbObjectStore, SlateDbOptions};
+/// The settings of the SlateDB backend, re-exported from the `slatedb` crate: it is their own type,
+/// so `Settings::from_file` and its fields are available without mirroring them.
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+pub use slatedb::config::Settings as SlateDbSettings;
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb", feature = "slatedb"))]
+pub use crate::storage::migration::MigrationReport;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 use crate::storage::StorageOptions;
 #[cfg(not(target_family = "wasm"))]
@@ -173,12 +181,54 @@ impl Store {
     /// Opens a read-write [`Store`] and creates it if it does not exist yet.
     ///
     /// Only one read-write [`Store`] can exist at the same time.
-    /// If you want to have extra [`Store`] instance opened on the same data
-    /// use [`Store::open_read_only`].
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    /// RocksDB is used when its feature is enabled; a build with only the `slatedb` feature opens a
+    /// SlateDB database instead.
+    #[cfg_attr(
+        feature = "rocksdb",
+        doc = "If you want to have extra [`Store`] instance opened on the same data use [`Store::open_read_only`]."
+    )]
+    #[cfg_attr(
+        not(feature = "rocksdb"),
+        doc = "Opening a second read-write `Store` on a SlateDB database does not fail: it takes the writer role over and the first `Store` starts failing its writes."
+    )]
+    #[cfg_attr(
+        feature = "slatedb",
+        doc = "Use [`Store::open_with_slate_db`] to ask for SlateDB explicitly."
+    )]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Ok(Self {
             storage: Storage::open(path.as_ref())?,
+        })
+    }
+
+    /// Opens a read-write [`Store`] backed by a SlateDB database, creating it if it does not exist
+    /// yet.
+    ///
+    /// Opening a second read-write `Store` on the same database does not fail: SlateDB fences the
+    /// previous writer, whose next writes then return an error saying that the store was fenced or
+    /// closed by another writer.
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    pub fn open_with_slate_db(options: SlateDbOptions) -> Result<Self, StorageError> {
+        Ok(Self {
+            storage: Storage::open_slatedb_with_options(options)?,
+        })
+    }
+
+    /// Opens a read-only [`Store`] backed by a SlateDB database.
+    ///
+    /// The database is read through a [`DbReader`](https://docs.rs/slatedb) that follows the latest
+    /// manifest without writing anything, so opening it does not take the writer role and does not
+    /// fence the process writing the database. Reading a database that another process is writing
+    /// is still undefined behavior, as SlateDB garbage collection may delete the objects the reader
+    /// needs: use [`Store::backup`] or a checkpoint for a consistent copy.
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    pub fn open_slate_db_read_only(options: SlateDbOptions) -> Result<Self, StorageError> {
+        Ok(Self {
+            storage: Storage::open_slatedb_read_only(options)?,
         })
     }
 
@@ -197,6 +247,40 @@ impl Store {
         Ok(Self {
             storage: Storage::open_with_options(path.as_ref(), options.into())?,
         })
+    }
+
+    /// Copies a RocksDB database into a SlateDB one and returns what the migration did.
+    ///
+    /// The two backends share the RDF key encoding, so this is a copy of raw key/value pairs,
+    /// metadata included: the target keeps the `oxversion` of the source. The source is only ever
+    /// read, and the migration fails if another process is writing it.
+    ///
+    /// An interrupted migration resumes from its last committed key, unless `restart` is set, in
+    /// which case the whole source is copied again. When the copy is over, the target is reopened
+    /// and every quad is compared with the source.
+    ///
+    /// Usage example:
+    /// ```
+    /// use oxigraph::store::{SlateDbOptions, Store};
+    ///
+    /// # let source = tempfile::tempdir()?;
+    /// # let target = tempfile::tempdir()?;
+    /// # drop(Store::open(source.path())?);
+    /// let report = Store::migrate_from_rocks_db(
+    ///     source.path(),
+    ///     SlateDbOptions::at_directory(target.path()),
+    ///     false,
+    /// )?;
+    /// println!("{} keys copied", report.copied_keys);
+    /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
+    /// ```
+    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb", feature = "slatedb"))]
+    pub fn migrate_from_rocks_db(
+        source: impl AsRef<Path>,
+        options: SlateDbOptions,
+        restart: bool,
+    ) -> Result<MigrationReport, StorageError> {
+        crate::storage::migration::migrate(source.as_ref(), options, restart)
     }
 
     /// Opens a read-only [`Store`] from disk.
@@ -691,6 +775,12 @@ impl Store {
     /// assert_eq!(1, store.named_graphs().count());
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
+    ///
+    /// <div class="warning">With the SlateDB backend, the quads of the graph are deleted one by
+    /// one inside a single transaction: the deletion holds about a kilobyte of pending deletes per
+    /// key (six per quad of a named graph) until the commit, and is refused with a
+    /// [`StorageError`] above
+    /// <code>SlateDbOptions::with_max_clear_deletes</code>.</div>
     pub fn clear_graph(&self, graph_name: &GraphName) -> Result<(), StorageError> {
         if graph_name.is_default_graph() {
             let mut transaction = self.storage.start_transaction()?;
@@ -750,6 +840,12 @@ impl Store {
     /// assert!(store.is_empty()?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
+    ///
+    /// <div class="warning">With the SlateDB backend, clearing is a full scan that deletes every
+    /// key one by one inside a single transaction, instead of a constant number of range deletes.
+    /// It is therefore proportional to the size of the database, holds about a kilobyte of pending
+    /// deletes per key until the commit, and is refused with a [`StorageError`] above
+    /// <code>SlateDbOptions::with_max_clear_deletes</code>.</div>
     pub fn clear(&self) -> Result<(), StorageError> {
         let mut transaction = self.storage.start_transaction()?;
         transaction.clear();
@@ -759,7 +855,10 @@ impl Store {
     /// Flushes all buffers and ensures that all writes are saved on disk.
     ///
     /// Flushes are automatically done using background threads but might lag a little bit.
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
     pub fn flush(&self) -> Result<(), StorageError> {
         self.storage.flush()
     }
@@ -769,7 +868,13 @@ impl Store {
     /// Useful to call after a batch upload or another similar operation.
     ///
     /// <div class="warning">Can take hours on huge databases.</div>
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    ///
+    /// <div class="warning">With the SlateDB backend this is a no-op: SlateDB compacts in its own
+    /// background component, which the database handle cannot trigger.</div>
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
     pub fn optimize(&self) -> Result<(), StorageError> {
         self.storage.compact()
     }
@@ -786,13 +891,18 @@ impl Store {
     ///
     /// <div class="warning">An error is raised if the `target_directory` already exists.</div>
     ///
-    /// If the target directory is in the same file system as the current database,
+    /// With the RocksDB backend, if the target directory is in the same file system as the current database,
     /// the database content will not be fully copied
     /// but hard links will be used to point to the original database immutable snapshots.
     /// This allows cheap regular backups.
+    /// With the SlateDB backend, the backup is a logical copy of every key of a snapshot, so it is
+    /// proportional to the size of the database and needs as much space as the database itself.
     ///
     /// If you want to move your data to another RDF storage system, you should have a look at the [`Store::dump_to_writer`] function instead.
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
     pub fn backup(&self, target_directory: impl AsRef<Path>) -> Result<(), StorageError> {
         self.storage.backup(target_directory.as_ref())
     }
@@ -819,6 +929,13 @@ impl Store {
     /// assert!(store.contains(&Quad::new(ex.clone(), ex.clone(), ex.clone(), ex))?);
     /// # Result::<_, Box<dyn std::error::Error>>::Ok(())
     /// ```
+    ///
+    /// With the SlateDB backend, the loader has no way to ingest files directly: it encodes the
+    /// quads on background threads and writes them through the normal write path, so it is bound by
+    /// writes and compaction rather than by the CPU. A non atomic load
+    /// ([`BulkLoader::without_atomicity`]) is visible while it runs and needs much less memory than
+    /// the default atomic one, which stages all the loaded quads in memory and fails above
+    /// `SlateDbOptions::with_bulk_load_max_staged_bytes`.
     pub fn bulk_loader(&self) -> BulkLoader<'_> {
         BulkLoader {
             storage: self.storage.bulk_loader(),
@@ -1369,6 +1486,10 @@ impl BulkLoader<'_> {
     /// Allow the bulk loader to save also data to the database during the bulk loading instead of only when [`commit`](Self::commit) is called.
     ///
     /// When used with the RocksDB storage, it allows the storage to compact the data while the loading continues.
+    /// When used with the SlateDB storage, it keeps the size of the write batches, and so the memory
+    /// used, bounded whatever the size of the loaded file: the atomic load stages everything in
+    /// memory and commits it at once, which is limited by `SlateDbOptions::with_bulk_load_max_staged_bytes`
+    /// and much slower on a million quads.
     pub fn without_atomicity(mut self) -> Self {
         self.storage = self.storage.without_atomicity();
         self

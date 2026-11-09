@@ -11,23 +11,24 @@ use crate::storage::binary_encoder::{
 };
 pub use crate::storage::error::{CorruptionError, StorageError};
 use crate::storage::numeric_encoder::{
-    Decoder, EncodedQuad, EncodedTerm, StrHash, StrHashHasher, StrLookup, insert_term,
+    Decoder, EncodedQuad, EncodedTerm, StrHash, StrLookup, insert_term,
 };
 use crate::storage::rocksdb_wrapper::{
     ColumnFamily, ColumnFamilyDefinition, Db, DbOptions, Iter, ReadableTransaction, Reader,
     Transaction,
 };
+#[cfg(feature = "slatedb")]
+use crate::storage::slatedb_keyspace::Ns;
+use crate::storage::bulk_encoder::BatchedKeys;
 use crate::storage::{DEFAULT_BULK_LOAD_BATCH_SIZE, map_thread_result};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::FxHashSet;
 #[cfg(feature = "rdf-12")]
 use siphasher::sip128::{Hasher128, SipHasher24};
 use spareval::CancellationToken;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::remove_file;
-use std::hash::BuildHasherDefault;
 #[cfg(feature = "rdf-12")]
 use std::hash::Hash;
-use std::mem::take;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
 use std::sync::{Arc, Mutex};
@@ -356,6 +357,61 @@ impl RocksDbStorage {
             reader: self.db.snapshot(),
             storage: self.clone(),
         }
+    }
+
+    /// The keyspace of each of the column families, in the order a migration copies them.
+    #[cfg(feature = "slatedb")]
+    fn namespaces(&self) -> [(Ns, &ColumnFamily); 12] {
+        [
+            (Ns::Meta, &self.default_cf),
+            (Ns::Id2Str, &self.id2str_cf),
+            (Ns::Spog, &self.spog_cf),
+            (Ns::Posg, &self.posg_cf),
+            (Ns::Ospg, &self.ospg_cf),
+            (Ns::Gspo, &self.gspo_cf),
+            (Ns::Gpos, &self.gpos_cf),
+            (Ns::Gosp, &self.gosp_cf),
+            (Ns::Dspo, &self.dspo_cf),
+            (Ns::Dpos, &self.dpos_cf),
+            (Ns::Dosp, &self.dosp_cf),
+            (Ns::Graphs, &self.graphs_cf),
+        ]
+    }
+
+    /// Calls `sink` with the namespace, key and value of every entry of the database, namespace by
+    /// namespace and key by key.
+    ///
+    /// The values are looked up again on the snapshot of the iterator: the RocksDB C API this crate
+    /// wraps only exposes the keys of an iterator. Used by the RocksDB to SlateDB migration
+    /// (planning/slatedb/implementation_plan2.md, §7.3).
+    #[cfg(feature = "slatedb")]
+    pub(crate) fn export_raw(
+        &self,
+        mut sink: impl FnMut(Ns, &[u8], &[u8]) -> Result<(), StorageError>,
+    ) -> Result<(), StorageError> {
+        let reader = self.db.snapshot();
+        for (ns, column_family) in self.namespaces() {
+            let mut iter = reader.iter(column_family);
+            while let Some(key) = iter.key() {
+                let value = reader.get(column_family, key)?;
+                let value = value.as_deref().unwrap_or_default();
+                sink(ns, key, value)?;
+                iter.next();
+            }
+            iter.status()?;
+        }
+        Ok(())
+    }
+
+    /// Counts the entries of every namespace.
+    #[cfg(feature = "slatedb")]
+    pub(crate) fn count_per_namespace(&self) -> Result<Vec<(Ns, u64)>, StorageError> {
+        let reader = self.db.snapshot();
+        let mut counts = Vec::with_capacity(12);
+        for (ns, column_family) in self.namespaces() {
+            counts.push((ns, reader.len(column_family)? as u64));
+        }
+        Ok(counts)
     }
 
     pub fn start_transaction(&self) -> Result<RocksDbStorageTransaction<'_>, StorageError> {
@@ -1426,7 +1482,7 @@ impl RocksDbStorageBulkLoader<'_> {
         let cancellation_token = self.cancellation_token.clone();
         self.threads.push_back(thread::spawn(move || {
             let mut sst_files = Vec::new();
-            match FileBulkLoader::new(&storage, batch.len(), cancellation_token).load(
+            match FileBulkLoader::new(&storage, cancellation_token).load(
                 batch,
                 &counter,
                 &mut sst_files,
@@ -1484,28 +1540,13 @@ impl RocksDbStorageBulkLoader<'_> {
 
 struct FileBulkLoader<'a> {
     storage: &'a RocksDbStorage,
-    id2str: HashMap<StrHash, Box<str>, BuildHasherDefault<StrHashHasher>>,
-    quads: FxHashSet<EncodedQuad>,
-    triples: FxHashSet<EncodedQuad>,
-    graphs: FxHashSet<EncodedTerm>,
     cancellation_token: CancellationToken,
 }
 
 impl<'a> FileBulkLoader<'a> {
-    fn new(
-        storage: &'a RocksDbStorage,
-        batch_size: usize,
-        cancellation_token: CancellationToken,
-    ) -> Self {
+    fn new(storage: &'a RocksDbStorage, cancellation_token: CancellationToken) -> Self {
         Self {
             storage,
-            id2str: HashMap::with_capacity_and_hasher(
-                3 * batch_size,
-                BuildHasherDefault::default(),
-            ),
-            quads: FxHashSet::with_capacity_and_hasher(batch_size, FxBuildHasher),
-            triples: FxHashSet::with_capacity_and_hasher(batch_size, FxBuildHasher),
-            graphs: FxHashSet::default(),
             cancellation_token,
         }
     }
@@ -1516,199 +1557,86 @@ impl<'a> FileBulkLoader<'a> {
         counter: &Mutex<u64>,
         sst_files: &mut Vec<(ColumnFamily, PathBuf)>,
     ) -> Result<(), StorageError> {
-        self.encode(quads)?;
-        let size = self.triples.len() + self.quads.len();
-        self.build_sst_files(sst_files)?;
+        let keys = BatchedKeys::encode(quads, &self.cancellation_token)?;
+        self.build_sst_files(&keys, sst_files)?;
         *counter
             .lock()
-            .map_err(|_| io::Error::other("Mutex poisoned"))? +=
-            size.try_into().unwrap_or(u64::MAX);
-        Ok(())
-    }
-
-    fn encode(&mut self, quads: Vec<Quad>) -> Result<(), StorageError> {
-        for quad in quads {
-            let encoded = EncodedQuad::from(&quad);
-            if quad.graph_name.is_default_graph() {
-                if self.triples.insert(encoded.clone()) {
-                    self.insert_term(quad.subject.into(), &encoded.subject);
-                    self.insert_term(quad.predicate.into(), &encoded.predicate);
-                    self.insert_term(quad.object, &encoded.object);
-                }
-            } else if self.quads.insert(encoded.clone()) {
-                self.insert_term(quad.subject.into(), &encoded.subject);
-                self.insert_term(quad.predicate.into(), &encoded.predicate);
-                self.insert_term(quad.object, &encoded.object);
-
-                if self.graphs.insert(encoded.graph_name.clone()) {
-                    self.insert_term(
-                        match quad.graph_name {
-                            GraphName::NamedNode(n) => n.into(),
-                            GraphName::BlankNode(n) => n.into(),
-                            GraphName::DefaultGraph => {
-                                return Err(CorruptionError::new(
-                                    "Default graph this not the default graph",
-                                )
-                                .into());
-                            }
-                        },
-                        &encoded.graph_name,
-                    );
-                }
-            }
-        }
+            .map_err(|_| io::Error::other("Mutex poisoned"))? += keys.quads;
         Ok(())
     }
 
     fn build_sst_files(
-        &mut self,
+        &self,
+        keys: &BatchedKeys,
         sst_files: &mut Vec<(ColumnFamily, PathBuf)>,
     ) -> Result<(), StorageError> {
-        // id2str
-        if !self.id2str.is_empty() {
+        if !keys.id2str.is_empty() {
             self.fail_if_cancelled()?;
-            let mut id2str = take(&mut self.id2str)
-                .into_iter()
-                .map(|(k, v)| (k.to_be_bytes(), v))
-                .collect::<Vec<_>>();
-            id2str.sort_unstable();
             let mut id2str_sst = self.storage.db.new_sst_file()?;
-            for (k, v) in id2str {
-                id2str_sst.insert(&k, v.as_bytes())?;
+            for (key, value) in &keys.id2str {
+                id2str_sst.insert(key, value.as_bytes())?;
             }
             sst_files.push((self.storage.id2str_cf.clone(), id2str_sst.finish()?));
         }
 
-        if !self.triples.is_empty() {
+        if !keys.dspo.is_empty() {
             self.fail_if_cancelled()?;
             sst_files.push((
                 self.storage.dspo_cf.clone(),
-                self.build_sst_for_keys(
-                    self.triples.iter().map(|quad| {
-                        encode_term_triple(&quad.subject, &quad.predicate, &quad.object)
-                    }),
-                )?,
+                self.build_sst_for_keys(&keys.dspo)?,
             ));
             sst_files.push((
                 self.storage.dpos_cf.clone(),
-                self.build_sst_for_keys(
-                    self.triples.iter().map(|quad| {
-                        encode_term_triple(&quad.predicate, &quad.object, &quad.subject)
-                    }),
-                )?,
+                self.build_sst_for_keys(&keys.dpos)?,
             ));
             sst_files.push((
                 self.storage.dosp_cf.clone(),
-                self.build_sst_for_keys(
-                    self.triples.iter().map(|quad| {
-                        encode_term_triple(&quad.object, &quad.subject, &quad.predicate)
-                    }),
-                )?,
+                self.build_sst_for_keys(&keys.dosp)?,
             ));
-            self.triples.clear();
         }
 
-        if !self.quads.is_empty() {
+        if !keys.spog.is_empty() {
             self.fail_if_cancelled()?;
             sst_files.push((
                 self.storage.graphs_cf.clone(),
-                self.build_sst_for_keys(self.graphs.iter().map(encode_term))?,
+                self.build_sst_for_keys(&keys.graphs)?,
             ));
-            self.graphs.clear();
-
             sst_files.push((
                 self.storage.gspo_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.graph_name,
-                        &quad.subject,
-                        &quad.predicate,
-                        &quad.object,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.gspo)?,
             ));
             sst_files.push((
                 self.storage.gpos_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.graph_name,
-                        &quad.predicate,
-                        &quad.object,
-                        &quad.subject,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.gpos)?,
             ));
             sst_files.push((
                 self.storage.gosp_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.graph_name,
-                        &quad.object,
-                        &quad.subject,
-                        &quad.predicate,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.gosp)?,
             ));
             self.fail_if_cancelled()?;
             sst_files.push((
                 self.storage.spog_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.subject,
-                        &quad.predicate,
-                        &quad.object,
-                        &quad.graph_name,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.spog)?,
             ));
             sst_files.push((
                 self.storage.posg_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.predicate,
-                        &quad.object,
-                        &quad.subject,
-                        &quad.graph_name,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.posg)?,
             ));
             sst_files.push((
                 self.storage.ospg_cf.clone(),
-                self.build_sst_for_keys(self.quads.iter().map(|quad| {
-                    encode_term_quad(
-                        &quad.object,
-                        &quad.subject,
-                        &quad.predicate,
-                        &quad.graph_name,
-                    )
-                }))?,
+                self.build_sst_for_keys(&keys.ospg)?,
             ));
-            self.quads.clear();
         }
         self.fail_if_cancelled()
     }
 
-    fn insert_term(&mut self, term: Term, encoded: &EncodedTerm) {
-        insert_term(term, encoded, &mut |key, value| {
-            self.id2str
-                .entry(*key)
-                .or_insert_with(|| value.as_ref().into());
-        })
-    }
-
-    fn build_sst_for_keys(
-        &self,
-        values: impl Iterator<Item = Vec<u8>>,
-    ) -> Result<PathBuf, StorageError> {
-        let mut values = values.collect::<Vec<_>>();
-        values.sort_unstable();
+    fn build_sst_for_keys(&self, values: &[Vec<u8>]) -> Result<PathBuf, StorageError> {
         let mut sst = self.storage.db.new_sst_file()?;
         for value in values {
-            sst.insert_empty(&value)?;
+            sst.insert_empty(value)?;
         }
         sst.finish()
     }
-
     fn fail_if_cancelled(&self) -> Result<(), StorageError> {
         if self.cancellation_token.is_cancelled() {
             Err(StorageError::Other("Cancelled".into()))

@@ -49,6 +49,7 @@ const TYPE_G_MONTH_LITERAL: u8 = 41;
 const TYPE_DURATION_LITERAL: u8 = 42;
 const TYPE_YEAR_MONTH_DURATION_LITERAL: u8 = 43;
 const TYPE_DAY_TIME_DURATION_LITERAL: u8 = 44;
+#[cfg(any(feature = "rocksdb", feature = "rdf-12"))]
 pub const TYPE_STAR_TRIPLE: u8 = 48;
 #[cfg(feature = "rdf-12")]
 const TYPE_TRIPLE: u8 = 49;
@@ -98,7 +99,10 @@ impl QuadEncoding {
     }
 }
 
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "rocksdb", feature = "slatedb")
+))]
 pub fn decode_term(mut buffer: &[u8]) -> Result<EncodedTerm, StorageError> {
     buffer.read_term()
 }

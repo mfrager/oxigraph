@@ -11,22 +11,56 @@ use crate::storage::rocksdb::{
     RocksDbStorageBulkLoader, RocksDbStorageOptions, RocksDbStorageReadableTransaction,
     RocksDbStorageReader, RocksDbStorageTransaction,
 };
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+use crate::storage::slatedb::{
+    SlateDbChainedDecodingQuadIterator, SlateDbDecodingGraphIterator, SlateDbStorage,
+    SlateDbStorageBulkLoader, SlateDbStorageReadableTransaction, SlateDbStorageReader,
+    SlateDbStorageTransaction,
+};
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+pub use crate::storage::slatedb::{SlateDbDurability, SlateDbObjectStore, SlateDbOptions};
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "rocksdb", feature = "slatedb")
+))]
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use std::{io, thread};
 
-#[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "rocksdb", feature = "slatedb")
+))]
 mod binary_encoder;
+#[cfg(all(
+    not(target_family = "wasm"),
+    any(feature = "rocksdb", feature = "slatedb")
+))]
+mod bulk_encoder;
 mod error;
 mod memory;
+/// One-way RocksDB to SlateDB migration (planning/slatedb/implementation_plan2.md, §7.3).
+#[cfg(all(not(target_family = "wasm"), feature = "rocksdb", feature = "slatedb"))]
+pub(crate) mod migration;
 pub mod numeric_encoder;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod rocksdb;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
 mod rocksdb_wrapper;
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+mod slatedb;
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+mod slatedb_bridge;
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+mod slatedb_keyspace;
 pub mod small_string;
 
+// Backend gate: code that only needs *some* on-disk backend, whichever it is, is gated on
+//     all(not(target_family = "wasm"), any(feature = "rocksdb", feature = "slatedb"))
+// and must keep compiling with `feature = "slatedb"` alone. The backend-neutral constructor
+// `Storage::open` follows that gate and picks RocksDB when it is enabled, SlateDB otherwise. Code
+// that only makes sense for one backend (`open_with_options`, `open_read_only`, `StorageOptions`)
+// stays gated on its own feature.
 pub const DEFAULT_BULK_LOAD_BATCH_SIZE: usize = 1_000_000;
 
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
@@ -56,6 +90,8 @@ pub struct Storage {
 enum StorageKind {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorage),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbStorage),
     Memory(MemoryStorage),
 }
 
@@ -67,10 +103,44 @@ impl Storage {
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    /// Opens the default on-disk backend, creating its database if needed.
+    ///
+    /// RocksDB is preferred when both backends are enabled; it is the backend Oxigraph has always
+    /// used. A build with only the `slatedb` feature opens a SlateDB database instead.
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
     pub fn open(path: &Path) -> Result<Self, StorageError> {
+        #[cfg(feature = "rocksdb")]
+        {
+            Ok(Self {
+                kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
+            })
+        }
+        #[cfg(not(feature = "rocksdb"))]
+        {
+            Ok(Self {
+                kind: StorageKind::SlateDb(SlateDbStorage::open_at(path)?),
+            })
+        }
+    }
+
+    /// Opens the SlateDB database described by `options`, creating it if needed.
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    pub fn open_slatedb_with_options(options: SlateDbOptions) -> Result<Self, StorageError> {
         Ok(Self {
-            kind: StorageKind::RocksDb(RocksDbStorage::open(path)?),
+            kind: StorageKind::SlateDb(SlateDbStorage::open_with_options(options)?),
+        })
+    }
+
+    /// Opens the SlateDB database described by `options` without taking the writer role.
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    pub fn open_slatedb_read_only(options: SlateDbOptions) -> Result<Self, StorageError> {
+        Ok(Self {
+            kind: StorageKind::SlateDb(SlateDbStorage::open_with_options(
+                options.with_read_only(true),
+            )?),
         })
     }
 
@@ -99,6 +169,8 @@ impl Storage {
             kind: match &self.kind {
                 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
                 StorageKind::RocksDb(storage) => StorageReaderKind::RocksDb(storage.snapshot()),
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageKind::SlateDb(storage) => StorageReaderKind::SlateDb(storage.snapshot()),
                 StorageKind::Memory(storage) => StorageReaderKind::Memory(storage.snapshot()),
             },
         }
@@ -115,6 +187,10 @@ impl Storage {
                 StorageKind::RocksDb(storage) => {
                     StorageTransactionKind::RocksDb(storage.start_transaction()?)
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageKind::SlateDb(storage) => {
+                    StorageTransactionKind::SlateDb(storage.start_transaction()?)
+                }
                 StorageKind::Memory(storage) => {
                     StorageTransactionKind::Memory(storage.start_transaction())
                 }
@@ -123,7 +199,10 @@ impl Storage {
     }
 
     #[cfg_attr(
-        not(all(not(target_family = "wasm"), feature = "rocksdb")),
+        not(all(
+            not(target_family = "wasm"),
+            any(feature = "rocksdb", feature = "slatedb")
+        )),
         expect(clippy::unnecessary_wraps)
     )]
     pub fn start_readable_transaction(
@@ -135,6 +214,10 @@ impl Storage {
                 StorageKind::RocksDb(storage) => {
                     StorageReadableTransactionKind::RocksDb(storage.start_readable_transaction()?)
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageKind::SlateDb(storage) => StorageReadableTransactionKind::SlateDb(
+                    storage.start_readable_transaction()?,
+                ),
                 StorageKind::Memory(storage) => {
                     StorageReadableTransactionKind::Memory(storage.start_transaction())
                 }
@@ -142,29 +225,71 @@ impl Storage {
         })
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
+    #[cfg_attr(
+        not(all(
+            not(target_family = "wasm"),
+            any(feature = "rocksdb", feature = "slatedb")
+        )),
+        expect(clippy::unnecessary_wraps)
+    )]
     pub fn flush(&self) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.flush(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageKind::SlateDb(storage) => storage.flush(),
             StorageKind::Memory(_) => Ok(()),
         }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
+    #[cfg_attr(
+        not(all(
+            not(target_family = "wasm"),
+            any(feature = "rocksdb", feature = "slatedb")
+        )),
+        expect(clippy::unnecessary_wraps)
+    )]
+    #[cfg_attr(
+        all(not(feature = "rocksdb"), feature = "slatedb"),
+        expect(clippy::unnecessary_wraps, reason = "both on-disk backends can compact")
+    )]
     pub fn compact(&self) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.compact(),
+            // SlateDB compacts itself in the background (planning/slatedb/implementation_plan2.md, D12).
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageKind::SlateDb(_) => Ok(()),
             StorageKind::Memory(_) => Ok(()),
         }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
-    pub fn backup(&self, target_directory: &Path) -> Result<(), StorageError> {
+    #[cfg(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    ))]
+    pub fn backup(
+        &self,
+        #[cfg_attr(
+            not(any(feature = "rocksdb", feature = "slatedb")),
+            expect(unused_variables, reason = "only on-disk databases have a backup")
+        )]
+        target_directory: &Path,
+    ) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.backup(target_directory),
+            // SlateDB backups are logical copies streamed from a snapshot (plan, D11).
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageKind::SlateDb(storage) => storage.backup(target_directory),
             StorageKind::Memory(_) => Err(StorageError::Other(
                 "It is not possible to backup an in-memory database".into(),
             )),
@@ -176,6 +301,10 @@ impl Storage {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => StorageBulkLoader {
                 kind: StorageBulkLoaderKind::RocksDb(storage.bulk_loader()),
+            },
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageKind::SlateDb(storage) => StorageBulkLoader {
+                kind: StorageBulkLoaderKind::SlateDb(storage.bulk_loader()),
             },
             StorageKind::Memory(storage) => StorageBulkLoader {
                 kind: StorageBulkLoaderKind::Memory(storage.bulk_loader()),
@@ -192,11 +321,16 @@ pub struct StorageReader<'a> {
 enum StorageReaderKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageReader<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbStorageReader),
     Memory(MemoryStorageReader<'a>),
 }
 
 #[cfg_attr(
-    not(all(not(target_family = "wasm"), feature = "rocksdb")),
+    not(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    )),
     expect(clippy::unnecessary_wraps)
 )]
 impl<'a> StorageReader<'a> {
@@ -204,6 +338,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.len(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.len(),
             StorageReaderKind::Memory(reader) => Ok(reader.len()),
         }
     }
@@ -212,6 +348,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.is_empty(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.is_empty(),
             StorageReaderKind::Memory(reader) => Ok(reader.is_empty()),
         }
     }
@@ -220,6 +358,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.contains(quad),
             StorageReaderKind::Memory(reader) => Ok(reader.contains(quad)),
         }
     }
@@ -237,6 +377,10 @@ impl<'a> StorageReader<'a> {
                 StorageReaderKind::RocksDb(reader) => DecodingQuadIteratorKind::RocksDb(
                     reader.quads_for_pattern(subject, predicate, object, graph_name),
                 ),
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageReaderKind::SlateDb(reader) => DecodingQuadIteratorKind::SlateDb(
+                    reader.quads_for_pattern(subject, predicate, object, graph_name),
+                ),
                 StorageReaderKind::Memory(reader) => DecodingQuadIteratorKind::Memory(
                     reader.quads_for_pattern(subject, predicate, object, graph_name),
                 ),
@@ -251,6 +395,10 @@ impl<'a> StorageReader<'a> {
                 StorageReaderKind::RocksDb(reader) => {
                     DecodingGraphIteratorKind::RocksDb(reader.named_graphs())
                 }
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageReaderKind::SlateDb(reader) => {
+                    DecodingGraphIteratorKind::SlateDb(reader.named_graphs())
+                }
                 StorageReaderKind::Memory(reader) => {
                     DecodingGraphIteratorKind::Memory(reader.named_graphs())
                 }
@@ -262,6 +410,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains_named_graph(graph_name),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.contains_named_graph(graph_name),
             StorageReaderKind::Memory(reader) => Ok(reader.contains_named_graph(graph_name)),
         }
     }
@@ -270,6 +420,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.contains_str(key),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.contains_str(key),
             StorageReaderKind::Memory(reader) => Ok(reader.contains_str(key)),
         }
     }
@@ -279,6 +431,8 @@ impl<'a> StorageReader<'a> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.validate(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.validate(),
             StorageReaderKind::Memory(reader) => reader.validate(),
         }
     }
@@ -292,6 +446,8 @@ pub struct DecodingQuadIterator<'a> {
 enum DecodingQuadIteratorKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbChainedDecodingQuadIterator<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbChainedDecodingQuadIterator),
     Memory(QuadIterator<'a>),
 }
 
@@ -302,6 +458,8 @@ impl Iterator for DecodingQuadIterator<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             DecodingQuadIteratorKind::RocksDb(iter) => iter.next(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            DecodingQuadIteratorKind::SlateDb(iter) => iter.next(),
             DecodingQuadIteratorKind::Memory(iter) => iter.next().map(Ok),
         }
     }
@@ -315,6 +473,8 @@ pub struct DecodingGraphIterator<'a> {
 enum DecodingGraphIteratorKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbDecodingGraphIterator<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbDecodingGraphIterator),
     Memory(MemoryDecodingGraphIterator<'a>),
 }
 
@@ -325,6 +485,8 @@ impl Iterator for DecodingGraphIterator<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             DecodingGraphIteratorKind::RocksDb(iter) => iter.next(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            DecodingGraphIteratorKind::SlateDb(iter) => iter.next(),
             DecodingGraphIteratorKind::Memory(iter) => iter.next().map(Ok),
         }
     }
@@ -335,6 +497,8 @@ impl StrLookup for StorageReader<'_> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReaderKind::RocksDb(reader) => reader.get_str(key),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReaderKind::SlateDb(reader) => reader.get_str(key),
             StorageReaderKind::Memory(reader) => reader.get_str(key),
         }
     }
@@ -348,11 +512,16 @@ pub struct StorageTransaction<'a> {
 enum StorageTransactionKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageTransaction<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbStorageTransaction),
     Memory(MemoryStorageTransaction<'a>),
 }
 
 #[cfg_attr(
-    not(all(not(target_family = "wasm"), feature = "rocksdb")),
+    not(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    )),
     expect(clippy::unnecessary_wraps)
 )]
 impl StorageTransaction<'_> {
@@ -360,6 +529,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.insert(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.insert(quad),
             StorageTransactionKind::Memory(transaction) => {
                 transaction.insert(quad);
             }
@@ -372,6 +543,10 @@ impl StorageTransaction<'_> {
             StorageTransactionKind::RocksDb(transaction) => {
                 transaction.insert_named_graph(graph_name)
             }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => {
+                transaction.insert_named_graph(graph_name)
+            }
             StorageTransactionKind::Memory(transaction) => {
                 transaction.insert_named_graph(graph_name);
             }
@@ -382,6 +557,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.remove(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.remove(quad),
             StorageTransactionKind::Memory(transaction) => transaction.remove(quad),
         }
     }
@@ -390,6 +567,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.clear_default_graph(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.clear_default_graph(),
             StorageTransactionKind::Memory(transaction) => {
                 transaction.clear_graph(&GraphName::DefaultGraph)
             }
@@ -400,6 +579,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.clear_all_named_graphs(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.clear_all_named_graphs(),
             StorageTransactionKind::Memory(transaction) => transaction.clear_all_named_graphs(),
         }
     }
@@ -408,6 +589,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.clear_all_graphs(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.clear_all_graphs(),
             StorageTransactionKind::Memory(transaction) => transaction.clear_all_graphs(),
         }
     }
@@ -416,6 +599,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.remove_all_named_graphs(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.remove_all_named_graphs(),
             StorageTransactionKind::Memory(transaction) => transaction.remove_all_named_graphs(),
         }
     }
@@ -424,6 +609,8 @@ impl StorageTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.clear(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.clear(),
             StorageTransactionKind::Memory(transaction) => transaction.clear(),
         }
     }
@@ -432,6 +619,8 @@ impl StorageTransaction<'_> {
         match self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageTransactionKind::RocksDb(transaction) => transaction.commit(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageTransactionKind::SlateDb(transaction) => transaction.commit(),
             StorageTransactionKind::Memory(transaction) => {
                 transaction.commit();
                 Ok(())
@@ -448,11 +637,16 @@ pub struct StorageReadableTransaction<'a> {
 enum StorageReadableTransactionKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageReadableTransaction<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbStorageReadableTransaction),
     Memory(MemoryStorageTransaction<'a>),
 }
 
 #[cfg_attr(
-    not(all(not(target_family = "wasm"), feature = "rocksdb")),
+    not(all(
+        not(target_family = "wasm"),
+        any(feature = "rocksdb", feature = "slatedb")
+    )),
     expect(clippy::unnecessary_wraps)
 )]
 impl StorageReadableTransaction<'_> {
@@ -462,6 +656,10 @@ impl StorageReadableTransaction<'_> {
                 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
                 StorageReadableTransactionKind::RocksDb(transaction) => {
                     StorageReaderKind::RocksDb(transaction.reader())
+                }
+                #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+                StorageReadableTransactionKind::SlateDb(transaction) => {
+                    StorageReaderKind::SlateDb(transaction.reader())
                 }
                 StorageReadableTransactionKind::Memory(transaction) => {
                     StorageReaderKind::Memory(transaction.reader())
@@ -474,6 +672,8 @@ impl StorageReadableTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => transaction.insert(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => transaction.insert(quad),
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.insert(quad);
             }
@@ -486,6 +686,10 @@ impl StorageReadableTransaction<'_> {
             StorageReadableTransactionKind::RocksDb(transaction) => {
                 transaction.insert_named_graph(graph_name)
             }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => {
+                transaction.insert_named_graph(graph_name)
+            }
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.insert_named_graph(graph_name);
             }
@@ -496,6 +700,8 @@ impl StorageReadableTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => transaction.remove(quad),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => transaction.remove(quad),
             StorageReadableTransactionKind::Memory(transaction) => transaction.remove(quad),
         }
     }
@@ -504,6 +710,10 @@ impl StorageReadableTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => {
+                transaction.clear_graph(graph_name)
+            }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => {
                 transaction.clear_graph(graph_name)
             }
             StorageReadableTransactionKind::Memory(transaction) => {
@@ -519,6 +729,10 @@ impl StorageReadableTransaction<'_> {
             StorageReadableTransactionKind::RocksDb(transaction) => {
                 transaction.clear_all_named_graphs()
             }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => {
+                transaction.clear_all_named_graphs()
+            }
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.clear_all_named_graphs();
                 Ok(())
@@ -530,6 +744,8 @@ impl StorageReadableTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => transaction.clear_all_graphs(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => transaction.clear_all_graphs(),
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.clear_all_graphs();
                 Ok(())
@@ -546,6 +762,10 @@ impl StorageReadableTransaction<'_> {
             StorageReadableTransactionKind::RocksDb(transaction) => {
                 transaction.remove_named_graph(graph_name)
             }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => {
+                transaction.remove_named_graph(graph_name)
+            }
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.remove_named_graph(graph_name);
                 Ok(())
@@ -559,6 +779,10 @@ impl StorageReadableTransaction<'_> {
             StorageReadableTransactionKind::RocksDb(transaction) => {
                 transaction.remove_all_named_graphs()
             }
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => {
+                transaction.remove_all_named_graphs()
+            }
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.remove_all_named_graphs();
                 Ok(())
@@ -570,6 +794,8 @@ impl StorageReadableTransaction<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => transaction.clear(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => transaction.clear(),
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.clear();
                 Ok(())
@@ -581,6 +807,8 @@ impl StorageReadableTransaction<'_> {
         match self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageReadableTransactionKind::RocksDb(transaction) => transaction.commit(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageReadableTransactionKind::SlateDb(transaction) => transaction.commit(),
             StorageReadableTransactionKind::Memory(transaction) => {
                 transaction.commit();
                 Ok(())
@@ -597,6 +825,8 @@ pub struct StorageBulkLoader<'a> {
 enum StorageBulkLoaderKind<'a> {
     #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     RocksDb(RocksDbStorageBulkLoader<'a>),
+    #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+    SlateDb(SlateDbStorageBulkLoader),
     Memory(MemoryStorageBulkLoader<'a>),
 }
 
@@ -606,6 +836,10 @@ impl StorageBulkLoader<'_> {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageBulkLoaderKind::RocksDb(loader) => Self {
                 kind: StorageBulkLoaderKind::RocksDb(loader.on_progress(callback)),
+            },
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageBulkLoaderKind::SlateDb(loader) => Self {
+                kind: StorageBulkLoaderKind::SlateDb(loader.on_progress(callback)),
             },
             StorageBulkLoaderKind::Memory(loader) => Self {
                 kind: StorageBulkLoaderKind::Memory(loader.on_progress(callback)),
@@ -619,6 +853,10 @@ impl StorageBulkLoader<'_> {
             StorageBulkLoaderKind::RocksDb(loader) => Self {
                 kind: StorageBulkLoaderKind::RocksDb(loader.without_atomicity()),
             },
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageBulkLoaderKind::SlateDb(loader) => Self {
+                kind: StorageBulkLoaderKind::SlateDb(loader.without_atomicity()),
+            },
             StorageBulkLoaderKind::Memory(loader) => Self {
                 kind: StorageBulkLoaderKind::Memory(loader),
             },
@@ -626,7 +864,10 @@ impl StorageBulkLoader<'_> {
     }
 
     #[cfg_attr(
-        any(target_family = "wasm", not(feature = "rocksdb")),
+        any(
+            target_family = "wasm",
+            not(any(feature = "rocksdb", feature = "slatedb"))
+        ),
         expect(clippy::unnecessary_wraps, unused_variables)
     )]
     pub fn load_batch(
@@ -637,6 +878,8 @@ impl StorageBulkLoader<'_> {
         match &mut self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageBulkLoaderKind::RocksDb(loader) => loader.load_batch(quads, max_num_threads),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageBulkLoaderKind::SlateDb(loader) => loader.load_batch(quads, max_num_threads),
             StorageBulkLoaderKind::Memory(loader) => {
                 loader.load_batch(quads);
                 Ok(())
@@ -645,13 +888,18 @@ impl StorageBulkLoader<'_> {
     }
 
     #[cfg_attr(
-        any(target_family = "wasm", not(feature = "rocksdb")),
+        any(
+            target_family = "wasm",
+            not(any(feature = "rocksdb", feature = "slatedb"))
+        ),
         expect(clippy::unnecessary_wraps)
     )]
     pub fn commit(self) -> Result<(), StorageError> {
         match self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageBulkLoaderKind::RocksDb(loader) => loader.commit(),
+            #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+            StorageBulkLoaderKind::SlateDb(loader) => loader.commit(),
             StorageBulkLoaderKind::Memory(loader) => {
                 loader.commit();
                 Ok(())

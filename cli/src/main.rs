@@ -17,7 +17,7 @@ use oxigraph::io::{JsonLdProfileSet, LoadedDocument, RdfFormat, RdfParser, RdfSe
 use oxigraph::model::{GraphName, IriParseError, NamedNode, NamedOrBlankNode, OxString};
 use oxigraph::sparql::results::{QueryResultsFormat, QueryResultsSerializer};
 use oxigraph::sparql::{CancellationToken, QueryResults, SparqlEvaluator};
-use oxigraph::store::{BulkLoader, LoaderError, Store};
+use oxigraph::store::{BulkLoader, LoaderError, SlateDbOptions, SlateDbSettings, Store};
 use oxiri::{Iri, IriRef};
 use rand::random;
 use rayon_core::ThreadPoolBuilder;
@@ -56,16 +56,19 @@ pub fn main() -> anyhow::Result<()> {
     match matches.command {
         Command::Serve {
             location,
+            object_store,
+            slatedb_config,
             bind,
             cors,
             union_default_graph,
             timeout_s,
         } => serve(
-            if let Some(location) = location {
-                Store::open(location)
-            } else {
-                Store::new()
-            }?,
+            open_store(
+                location.as_deref(),
+                object_store.as_deref(),
+                slatedb_config.as_deref(),
+                false,
+            )?,
             &bind,
             false,
             cors,
@@ -74,12 +77,19 @@ pub fn main() -> anyhow::Result<()> {
         ),
         Command::ServeReadOnly {
             location,
+            object_store,
+            slatedb_config,
             bind,
             cors,
             union_default_graph,
             timeout_s,
         } => serve(
-            Store::open_read_only(location)?,
+            open_store(
+                location.as_deref(),
+                object_store.as_deref(),
+                slatedb_config.as_deref(),
+                true,
+            )?,
             &bind,
             true,
             cors,
@@ -88,14 +98,40 @@ pub fn main() -> anyhow::Result<()> {
         ),
         Command::Backup {
             location,
+            object_store,
+            slatedb_config,
             destination,
         } => {
-            let store = Store::open_read_only(location)?;
+            let store = open_store(
+                location.as_deref(),
+                object_store.as_deref(),
+                slatedb_config.as_deref(),
+                true,
+            )?;
             store.backup(destination)?;
+            Ok(())
+        }
+        Command::Migrate {
+            source,
+            object_store,
+            slatedb_config,
+            restart,
+        } => {
+            let options = slate_db_options(&object_store, slatedb_config.as_deref())?;
+            let report = Store::migrate_from_rocks_db(&source, options, restart)?;
+            eprintln!(
+                "Migrated {} keys from {} to {}{}.",
+                report.copied_keys,
+                source.display(),
+                object_store,
+                if report.resumed { " (resumed)" } else { "" }
+            );
             Ok(())
         }
         Command::Load {
             location,
+            object_store,
+            slatedb_config,
             file,
             non_atomic,
             lenient,
@@ -103,7 +139,12 @@ pub fn main() -> anyhow::Result<()> {
             base,
             graph,
         } => {
-            let store = Store::open(&location)?;
+            let store = open_store(
+                location.as_deref(),
+                object_store.as_deref(),
+                slatedb_config.as_deref(),
+                false,
+            )?;
             let format = if let Some(format) = format {
                 Some(rdf_format_from_name(&format)?)
             } else {
@@ -232,10 +273,12 @@ pub fn main() -> anyhow::Result<()> {
                         }
                     });
             }
-            eprintln!(
-                "If you plan to run a read-heavy workload, consider running `oxigraph optimize -l {}` before",
-                location.display()
-            );
+            if let Some(location) = &location {
+                eprintln!(
+                    "If you plan to run a read-heavy workload, consider running `oxigraph optimize -l {}` before",
+                    location.display()
+                );
+            }
             Ok(())
         }
         Command::Dump {
@@ -564,6 +607,46 @@ pub fn main() -> anyhow::Result<()> {
             }?;
             Ok(())
         }
+    }
+}
+
+/// Opens the store a command works on.
+///
+/// An object store URL selects the SlateDB backend; otherwise the default on-disk backend is used,
+/// or an in-memory store when no location is given.
+fn open_store(
+    location: Option<&Path>,
+    object_store: Option<&str>,
+    slatedb_config: Option<&Path>,
+    read_only: bool,
+) -> anyhow::Result<Store> {
+    if let Some(url) = object_store {
+        let options = slate_db_options(url, slatedb_config)?;
+        return Ok(if read_only {
+            Store::open_slate_db_read_only(options)?
+        } else {
+            Store::open_with_slate_db(options)?
+        });
+    }
+    Ok(match (location, read_only) {
+        (Some(location), false) => Store::open(location)?,
+        (Some(location), true) => Store::open_read_only(location)?,
+        (None, false) => Store::new()?,
+        (None, true) => bail!("--location or --object-store must be given"),
+    })
+}
+
+fn slate_db_options(url: &str, config: Option<&Path>) -> anyhow::Result<SlateDbOptions> {
+    let options = SlateDbOptions::at_url(url);
+    if let Some(config) = config {
+        Ok(options.with_settings(SlateDbSettings::from_file(config).with_context(|| {
+            format!(
+                "Could not read the SlateDB settings file {}",
+                config.display()
+            )
+        })?))
+    } else {
+        Ok(options)
     }
 }
 
