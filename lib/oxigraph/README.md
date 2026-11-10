@@ -79,6 +79,20 @@ oxigraph = { version = "*", default-features = false }
 ```
 This is the default behavior when compiling Oxigraph to WASM.
 
+### SlateDB backend
+
+The database can also live in an object store (S3, RustFS, MinIO…) instead of a local directory, using the [SlateDB backend](../docs/slatedb.md) behind the `slatedb` feature:
+```toml
+oxigraph = { version = "*", features = ["slatedb"] }
+```
+```rust,no_run
+use oxigraph::store::{SlateDbOptions, Store};
+
+let store = Store::open_with_slate_db(SlateDbOptions::at_url("s3://bucket/database")).unwrap();
+assert!(store.is_empty().unwrap());
+```
+RocksDB stays the default backend. The SlateDB backend has four behaviour changes worth knowing before using it: a second writer fences the first, `clear` costs one pending key per deleted quad, bulk loads stage in memory unless loaded `without_atomicity`, and `optimize` is a no-op because SlateDB compacts itself. They are described in [`docs/slatedb.md`](../docs/slatedb.md), with the measured performance differences.
+
 ## License
 
 This project is licensed under either of

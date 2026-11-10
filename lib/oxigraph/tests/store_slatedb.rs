@@ -11,6 +11,7 @@ use oxigraph::sparql::{QueryResults, SparqlEvaluator};
 use oxigraph::store::{SlateDbDurability, SlateDbOptions, StorageError, Store};
 use std::error::Error;
 use std::fs::{create_dir_all, remove_dir};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -174,6 +175,202 @@ fn test_bulk_load_is_atomic_on_disk() -> Result<(), Box<dyn Error>> {
     drop(loader);
     assert!(store.is_empty()?);
     store.validate()?;
+    Ok(())
+}
+
+/// Copies a pinned fixture directory into `directory`, so that opening the database does not
+/// modify the fixture itself.
+fn copy_fixture(fixture: &str, directory: &TempDir) -> Result<(), Box<dyn Error>> {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(fixture);
+    create_dir_all(directory.path())?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let target = directory.path().join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_directory(from: &Path, to: &Path) -> Result<(), Box<dyn Error>> {
+    create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// The N-Quads dump of a store, with its lines sorted so that two backends can be compared.
+fn sorted_dump(store: &Store) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut buffer = Vec::new();
+    store.dump_to_writer(RdfFormat::NQuads, &mut buffer)?;
+    let mut lines = String::from_utf8(buffer)?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    lines.sort();
+    Ok(lines)
+}
+
+/// Measures what a query iterator held for longer than SlateDB's garbage collection age sees
+/// (planning/slatedb/implementation_plan2.md, Q8).
+///
+/// The default `wal_options.min_age` is 60 s: this test holds a `Store::iter()` open while the
+/// database is written to and the garbage collector runs, then reads from it and reports whether
+/// the quads are still there. It is ignored because it takes more than a minute; run it with
+/// `cargo test -p oxigraph --features slatedb --test store_slatedb -- --ignored --nocapture
+/// measure_a_held_iterator`.
+#[test]
+#[ignore = "takes more than a minute: measurement of the Q8 snapshot lifetime question"]
+#[expect(clippy::print_stderr, reason = "the measurement is its output")]
+fn measure_a_held_iterator() -> Result<(), Box<dyn Error>> {
+    let dir = TempDir::new()?;
+    let store = open(&dir)?;
+    store.extend(generated_quads(2_000, None))?;
+    store.flush()?;
+
+    // The iterator takes a snapshot of the database, as every query does.
+    let mut held = store.iter();
+    let first = held.next().transpose()?;
+    assert!(first.is_some());
+
+    // Keep writing and flushing so that the compactor and the garbage collector have work.
+    let started = Instant::now();
+    for round in 0..6 {
+        store.extend(generated_quads(500, None))?;
+        store.flush()?;
+        eprintln!(
+            "round {round}: {} quads, {:.1}s",
+            store.len()?,
+            started.elapsed().as_secs_f64()
+        );
+        std::thread::sleep(Duration::from_secs(12));
+    }
+    eprintln!("held for {:.1}s", started.elapsed().as_secs_f64());
+
+    // Does the held snapshot still see the data it was created with?
+    let mut seen = usize::from(first.is_some());
+    let mut error = None;
+    for quad in held {
+        match quad {
+            Ok(_) => seen += 1,
+            Err(error_) => {
+                error = Some(error_.to_string());
+                break;
+            }
+        }
+    }
+    match &error {
+        Some(error) => {
+            eprintln!("after the wait, the held iterator produced {seen} quads, error: {error}");
+        }
+        None => eprintln!("after the wait, the held iterator produced {seen} quads, no error"),
+    }
+    assert!(seen > 0);
+    Ok(())
+}
+
+#[test]
+fn test_dump_matches_the_other_backends() -> Result<(), Box<dyn Error>> {
+    let memory = Store::new()?;
+    let dir = TempDir::new()?;
+    let slatedb = open(&dir)?;
+    #[cfg(feature = "rocksdb")]
+    let rocksdb_dir = TempDir::new()?;
+    #[cfg(feature = "rocksdb")]
+    let rocksdb = Store::open(&rocksdb_dir)?;
+    let backends: Vec<(&str, &Store)> = [
+        ("memory", &memory),
+        ("SlateDB", &slatedb),
+        #[cfg(feature = "rocksdb")]
+        ("RocksDB", &rocksdb),
+    ]
+    .into_iter()
+    .collect();
+
+    for (name, store) in &backends {
+        store.load_from_reader(RdfFormat::TriG, GRAPH_DATA.as_bytes())?;
+        store.load_from_reader(RdfFormat::Turtle, DATA.as_bytes())?;
+        assert_eq!(store.len()?, NUMBER_OF_TRIPLES * 2, "{name}");
+    }
+    let expected = sorted_dump(&memory)?;
+    for (name, store) in &backends[1..] {
+        assert_eq!(expected, sorted_dump(store)?, "the {name} dump differs");
+    }
+    slatedb.validate()?;
+    Ok(())
+}
+
+#[test]
+fn test_slatedb_backward_compatibility() -> Result<(), Box<dyn Error>> {
+    // The fixture is a database created by an earlier build of this backend: opening it must keep
+    // working, which is what catches an accidental key layout or format version change (§8.1).
+    let dir = TempDir::new()?;
+    copy_fixture("slatedb_fixture_data", &dir)?;
+    // We run twice to check that the database is properly saved and closed.
+    for _ in 0..2 {
+        let store = open(&dir)?;
+        for q in quads(GraphName::DefaultGraph) {
+            assert!(store.contains(&q)?);
+        }
+        let graph_name =
+            NamedNode::new_unchecked("http://www.wikidata.org/wiki/Special:EntityData/Q90");
+        for q in quads(graph_name.clone()) {
+            assert!(store.contains(&q)?);
+        }
+        assert!(store.contains_named_graph(&graph_name.into())?);
+        assert_eq!(store.len()?, NUMBER_OF_TRIPLES * 2);
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "rdf-12")]
+fn test_slatedb_rdf_star_backward_compatibility() -> Result<(), Box<dyn Error>> {
+    let dir = TempDir::new()?;
+    copy_fixture("slatedb_bc_rdf_star_data", &dir)?;
+    let s = NamedNode::new_unchecked("http://example.com/s");
+    let p = NamedNode::new_unchecked("http://example.com/p");
+    let o = NamedNode::new_unchecked("http://example.com/o");
+    let g = NamedNode::new_unchecked("http://example.com/g");
+    let bnode = BlankNode::new_unchecked("f2fef82410957224105241225fd0a648");
+    let triple = Term::Triple(Triple::new(s.clone(), p.clone(), o.clone()).into());
+    for _ in 0..2 {
+        let store = open(&dir)?;
+        for graph in [GraphName::from(g.clone()), GraphName::DefaultGraph] {
+            assert!(store.contains(&Quad::new(s.clone(), p.clone(), o.clone(), graph.clone()))?);
+            assert!(store.contains(&Quad::new(
+                bnode.clone(),
+                p.clone(),
+                o.clone(),
+                graph.clone()
+            ))?);
+            assert!(store.contains(&Quad::new(
+                s.clone(),
+                p.clone(),
+                bnode.clone(),
+                graph.clone()
+            ))?);
+            assert!(store.contains(&Quad::new(
+                bnode.clone(),
+                rdf::REIFIES,
+                triple.clone(),
+                graph.clone()
+            ))?);
+        }
+        assert_eq!(store.len()?, 8);
+    }
     Ok(())
 }
 

@@ -85,6 +85,8 @@ jobs:
         working-directory: ./lib/oxigraph
       - run: cargo clippy --all-targets --features rdf-12 -- -D warnings -D clippy::all
         working-directory: ./lib/oxigraph
+      - run: cargo clippy --all-targets --features slatedb -- -D warnings -D clippy::all
+        working-directory: ./lib/oxigraph
       - run: cargo clippy --all-targets -- -D warnings -D clippy::all
         working-directory: ./python
       - run: cargo clippy --all-targets --no-default-features -- -D warnings -D clippy::all
@@ -192,6 +194,17 @@ jobs:
           key: ${{ runner.os }}-rocksdb-9.10.0
       - run: bash .github/workflows/install_rocksdb.sh
       - run: cargo semver-checks check-release --exclude oxrocksdb-sys --exclude oxigraph-js --exclude pyoxigraph --exclude oxigraph-testsuite --exclude oxigraph-cli
+
+  test_slatedb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      # The fault-injection tests kill, fence and migrate between processes: they are unix only.
+      - run: cargo test -p oxigraph --features slatedb --lib --test store_slatedb --test slatedb_faults
 
   test_macos:
     runs-on: macos-latest

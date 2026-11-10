@@ -49,6 +49,8 @@ mod rocksdb;
 mod rocksdb_wrapper;
 #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
 mod slatedb;
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb", test))]
+mod slatedb_faults;
 #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
 mod slatedb_bridge;
 #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]

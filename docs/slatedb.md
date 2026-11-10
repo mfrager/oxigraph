@@ -93,9 +93,13 @@ re-exported as `oxigraph::store::SlateDbSettings`.
 `oxigraph serve-read-only --object-store …` and `Store::open_slate_db_read_only` read the database
 through a SlateDB reader that follows the latest manifest without writing anything, so opening it
 does not take the writer role away from the process writing the database. Reading a database that
-another process is actively writing remains undefined behavior: SlateDB garbage collection may
-delete objects the reader still needs. Use read-only access on a database at rest, or read a
-`backup` instead.
+another process is actively writing remains undefined behavior: SlateDB garbage collection deletes
+objects by age, not by the readers that use them, and may delete objects the reader still needs.
+The default ages are 60 s for the write-ahead log and 24 h for the manifest and the tables, so a
+reader of a live database can break after a few minutes. Use read-only access on a database at
+rest, raise the `garbage_collector_options` ages above the lifetime of your readers, or read a
+`backup` instead. The same limits apply to a query iterator held open for a long time; see the
+[performance page](../planning/slatedb/performance.md).
 
 ## Backup, replication and durability
 
@@ -109,6 +113,91 @@ delete objects the reader still needs. Use read-only access on a database at res
   moving LSM tree, not a snapshot of a database.
 * Bucket versioning plus cross-region replication is the durability story for a real deployment, and
   the `backup` operation the point-in-time one. Oxigraph does not implement replication itself.
+
+## Behaviour changes against the RocksDB backend
+
+The RDF encoding, the SPARQL results and the `Store` API are the same. Four things behave
+differently, and none of them is configurable away:
+
+### One writer at a time: a second writer fences the first
+
+SlateDB allows a single writer per database. Opening the database for writing takes the writer role
+from whoever holds it, even in another process: the previous writer's next operation fails with
+`this store was fenced or closed by another writer`. There is no lock to wait on, so a deployment
+that starts a second server on the same database loses writes in the first one instead of refusing
+to start. Read-only opens (`serve-read-only`, `Store::open_slate_db_read_only`) do not take the
+writer role, and `backup` does not either.
+
+### `clear` and `clear_graph` cost one pending key per deleted quad
+
+SlateDB has no range delete, so a clear is expanded into one delete per key of the deleted quads:
+six keys for a named graph quad and three for a default graph quad. They are staged in the
+transaction until its commit, at about a kilobyte each, so memory grows with the size of the
+cleared graph — 1 M quads of a named graph takes about 5.3 GiB above the memory the process already
+used. `max_clear_deletes` (2 000 000 keys by default) fails a clear that would not fit instead of
+letting the process be killed; raise it only with the memory to match, about a gigabyte per million
+keys. Clearing costs the same time as with RocksDB: both backends are bound by the number of keys
+deleted.
+
+### A bulk load stages everything in memory unless it is non atomic
+
+`Store::bulk_loader()` without `without_atomicity()` keeps every encoded quad in memory until its
+single commit, so the load becomes visible at once or not at all. That is bounded by
+`bulk_load_max_staged_bytes` (2 GiB by default), which fails the load before the process runs out of
+memory, and it is slow above roughly 200 000 quads because one enormous write is much worse than
+several. `without_atomicity()` writes chunks of 50 000 quads, makes the load visible while it runs
+and is the path to use for millions of quads. RocksDB has the same atomicity knob but builds SST
+files instead, so its atomic load does not scale the same way.
+
+### `optimize` does nothing
+
+SlateDB compacts in the background on its own schedule. `Store::optimize()` and
+`oxigraph optimize` succeed immediately and change nothing; do not expect them to shrink the object
+store or to speed up later queries. The operational levers are the SlateDB settings
+(`compactor_options`, `l0_sst_size_bytes`, `max_unflushed_bytes`) and the object store's own
+lifecycle rules.
+
+## Performance
+
+The same workloads on the same machine, RocksDB against SlateDB (details and the method in
+[`planning/slatedb/performance.md`](../planning/slatedb/performance.md)):
+
+| workload | RocksDB | SlateDB |
+| --- | --- | --- |
+| 100 `Store::insert`, `Wal` durability | 1.63 ms | 10.12 s |
+| 100 `Store::insert`, `Process` durability | 1.63 ms | 2.87 ms |
+| `Store::extend` of 10 000 quads | 46.4 ms | 121 ms |
+| atomic bulk load of 100 000 quads | 406 ms | 968 ms |
+| non atomic bulk load of 100 000 quads | 406 ms | 731 ms |
+| 1 000 point lookups (`Store::contains`) | 1.83 ms | 17.5 ms |
+| scan returning 100 of 1 000 quads | 363 µs | 3.68 ms |
+| 3 SPARQL queries over 1 000 quads | 3.88 ms | 36.1 ms |
+| `clear_graph` of a 100 000 quad named graph | 2.25 s | 2.35 s |
+| cold reopen of a 100 000 quad store | 47.1 ms | 449 ms |
+
+No workload is faster with SlateDB, which is why RocksDB stays the default backend. The costs are
+the expected price of an LSM tree on top of an object store abstraction: one durable flush per
+commit when `Wal` durability is asked for (101 ms against 16 µs per single-insert commit, removed by
+`Process` durability), one round trip per point lookup, no SST ingestion for bulk loads, and a
+manifest replay at startup. The list of known bottlenecks is in the performance page.
+
+The object store bill follows: a bulk load costs about 0.075 write and 0.081 read request per loaded
+quad on a local filesystem, and every commit that waits for its WAL is a request too. Bucket
+versioning plus lifecycle rules are the cost knobs of a real deployment.
+
+## Observability
+
+Oxigraph has no logging or metrics facility of its own, and the SlateDB backend does not add one.
+What a deployment can watch instead:
+
+* the object store: request counts, bytes, the objects under the database prefix, and their age
+  (the garbage collector deletes by age, see the read-only section);
+* SlateDB's own metrics, enabled with `metric_level` in the settings file
+  (`Disabled`, `Info`, `Debug` or `Trace`, `Info` being enough to see the flushes and compactions),
+  which SlateDB reports through its `metrics` facade;
+* `Store::len()`, `Store::validate()` and `Store::backup()` as the operational API.
+
+`optimize` does not help here: it is a no-op (see the behaviour changes above).
 
 ## Migrating a RocksDB database
 
@@ -125,10 +214,3 @@ oxigraph migrate --source /var/lib/oxigraph --object-store s3://oxigraph/db
 * When the copy is over, the target is reopened and every quad is compared with the source in key
   order, and `validate()` must pass.
 
-## What it costs
-
-SlateDB writes every commit to the object store, so a database costs object store requests and
-latency, not just disk: about 0.075 PUT and 0.081 GET per loaded quad on a bulk load, and a point
-lookup costs a round trip to the store when it is not cached. Measures of the backend against
-RocksDB, and the list of known bottlenecks, are in
-[`planning/slatedb/performance.md`](../planning/slatedb/performance.md).

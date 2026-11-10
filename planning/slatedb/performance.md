@@ -150,6 +150,37 @@ SlateDB keeps the WAL and the L0 SSTs it wrote until they are compacted, so its 
 larger than RocksDB's while a load is still settling; the 100 000 quad case is already compacted
 and smaller.
 
+## Held iterators and garbage collection (Q8)
+
+Q8 asked whether a long-lived snapshot (a `Store::iter()` held by a query) pins manifest and SST
+objects such that garbage collection is delayed unacceptably. The answer is the opposite of the
+question: SlateDB's garbage collector deletes objects by **age**, not by the snapshots that
+reference them, so a held snapshot never delays it. The risk is that it deletes something the
+snapshot still needs.
+
+Measured with the ignored `measure_a_held_iterator` test: a `Store::iter()` created on a 2 000 quad
+store was read once, then held while 6 more write-and-flush rounds ran over 73 s, well past the
+default `wal_options.min_age` of 60 s. The iterator then produced all 2 000 quads it had
+snapshotted, with no error. The reason is that a flush moves data into level 0 tables under
+`compacted/`, whose default `min_age` is 24 hours, so the objects a flushed snapshot needs outlive
+the wait by orders of magnitude; only WAL objects live 60 s, and they are no longer referenced once
+the data is flushed.
+
+The defaults, and therefore the limits of a held iterator:
+
+| directory | default `min_age` | what a held snapshot relies on |
+| --- | --- | --- |
+| `wal/` | 60 s | nothing, once the data is in a level 0 table |
+| `compacted/` (L0 and sorted runs) | 24 h | the data of the snapshot |
+| `manifest/` | 24 h | the version of the tree the snapshot reads |
+
+So a query iterator may safely live for minutes, and is only at risk if it is held for longer than
+the `compacted/` and `manifest/` age (a day with the defaults), or if `min_age` is lowered. A
+deployment that needs iterators held for days must raise `garbage_collector_options.compacted_options.min_age`
+and `...manifest_options.min_age` above that lifetime. This is also why reading a database that
+another process is writing is documented as undefined behavior for a read-only reader: the same
+age-based deletion applies to it, and it can sit on a version far older than the minimum age.
+
 ## Known bottlenecks
 
 1. **One durable flush per commit.** With `Wal` durability each commit waits for the next WAL

@@ -2330,10 +2330,12 @@ dependencies = [
 name = "oxigraph"
 version = "0.6.0-dev"
 dependencies = [
+ "async-trait",
  "bzip2",
  "codspeed-criterion-compat",
  "csv",
  "dashmap",
+ "futures-util",
  "getrandom 0.4.3",
  "js-sys",
  "libc",

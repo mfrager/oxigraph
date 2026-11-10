@@ -471,12 +471,33 @@ impl SlateDbStorage {
         Self::open_configured(&object_store, &prefix, config)
     }
 
+    /// Opens the database described by `options` in `object_store` instead of the one the options
+    /// name, so that tests can inject object store failures (planning/slatedb/implementation_plan2.md,
+    /// §8.2).
+    #[cfg(test)]
+    pub(crate) fn open_with_options_on_store(
+        options: SlateDbOptions,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<Self, StorageError> {
+        let (_, prefix, config) = options.into_parts();
+        Self::open_store(object_store, database_path(&prefix)?, config)
+    }
+
     fn open_configured(
         location: &SlateDbObjectStore,
         prefix: &str,
         config: SlateDbConfig,
     ) -> Result<Self, StorageError> {
         let (object_store, path) = location.open(prefix)?;
+        Self::open_store(object_store, path, config)
+    }
+
+    /// Opens a database at `path` inside `object_store`.
+    fn open_store(
+        object_store: Arc<dyn ObjectStore>,
+        path: ObjectStorePath,
+        config: SlateDbConfig,
+    ) -> Result<Self, StorageError> {
         let bridge = Arc::new(RuntimeBridge::new()?);
         let handle = if config.read_only {
             // A reader never takes the writer role, so opening a database read-only does not fence
@@ -1415,20 +1436,22 @@ impl SlateDbScan {
 
 /// A scan that may have failed to be created, so that the iterators built on it stay infallible to
 /// construct like the RocksDB ones.
-enum SlateDbScanState {
+pub(crate) enum SlateDbScanState {
     Ready(SlateDbScan),
     Failed(Option<StorageError>),
 }
 
 impl SlateDbScanState {
-    fn new(scan: Result<SlateDbScan, StorageError>) -> Self {
+    pub(crate) fn new(scan: Result<SlateDbScan, StorageError>) -> Self {
         match scan {
             Ok(scan) => Self::Ready(scan),
             Err(error) => Self::Failed(Some(error)),
         }
     }
 
-    fn next_key_value(&mut self) -> Option<Result<(Vec<u8>, Vec<u8>), StorageError>> {
+    pub(crate) fn next_key_value(
+        &mut self,
+    ) -> Option<Result<(Vec<u8>, Vec<u8>), StorageError>> {
         match self {
             Self::Ready(scan) => scan.next_key_value(),
             Self::Failed(error) => error.take().map(Err),

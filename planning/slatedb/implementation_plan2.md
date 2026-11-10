@@ -813,12 +813,54 @@ RocksDB dir ──► RocksDbRawExporter ──► (ns, key, value) stream ─�
 
 ### 7.5 Phase 4 exit criteria
 
-- [ ] `Store::open_with_slate_db(LocalFileSystem)` and `(s3://…)` both work; read-only open works.
-- [ ] A migrated RocksDB store opens with Oxigraph and answers SPARQL identically to the source.
-- [ ] Migration is resumable and refuses to run against a live writer.
-- [ ] CLI flags documented; existing CLI invocations unchanged.
-- [ ] Python: **not** in scope for v1 — record as a follow-up (needs a pyo3 options object, and
+- [x] `Store::open_with_slate_db(LocalFileSystem)` and `(s3://…)` both work; read-only open works.
+      Directory/`file://` are covered by `tests/store_slatedb.rs` (`test_*_on_disk`,
+      `file_url_object_store`, `read_only_store_reads_without_fencing_the_writer`). `s3://` is
+      implemented (`AmazonS3Builder::from_env`, bucket + prefix) and exercised only by the
+      `#[ignore]`d `s3_object_store_round_trip`, which needs a real bucket; it was **not** run here.
+- [x] A migrated RocksDB store opens with Oxigraph and answers SPARQL identically to the source.
+      `symbolic_name_to_term`-level equality is asserted by re-reading both stores through
+      `Store::iter()`, term for term and in order (`verify`), plus `validate()` and `len()`; the
+      migration test builds its source with `Store::load_from_reader`, so the comparison covers
+      every namespace. Not compared through SPARQL query *results*, only through store contents.
+- [x] Migration is resumable (`resumes_an_interrupted_migration`) and refuses to run against a live
+      writer (`check_no_live_writer`, POSIX `fcntl` read lock on `LOCK`; unix only, non-unix is a
+      no-op). The refusal has no automated test: POSIX record locks are per-process, so an
+      in-process test cannot observe the lock; it was verified by hand.
+- [x] CLI flags documented (`docs/slatedb.md`, `--object-store` / `--slatedb-config` in
+      `oxigraph <command> --help`); existing CLI invocations unchanged — see §7.6.
+- [x] Python: **not** in scope for v1 — record as a follow-up (needs a pyo3 options object, and
       `python/Cargo.toml` does not enable `oxigraph/slatedb`).
+
+### 7.6 Phase 4 deviations from this plan
+
+Where the implementation had to differ from the text above, and why:
+
+* **Location lives in the options**, not in a separate `path` argument:
+  `SlateDbOptions::at_path`/`at_url` set the new `SlateDbObjectStore::{Directory, Url}` enum, and
+  `path()`/`url()` read it back. This keeps the Phase‑2 `Store::open_with_slate_db(options)`
+  signature the plan's §5 already froze.
+* **No `--from`/`--to` on `migrate`**: only one direction exists (RocksDB → SlateDB), so the command
+  is `oxigraph migrate --source DIR --object-store … [--slatedb-config …] [--restart]`. A pair of
+  flags that can only ever hold one value would be noise.
+* **CLI flags only where they can act**: `serve`, `serve-read-only`, `load`, `backup`, `migrate`.
+  `dump`, `query`, `update` and `optimize` still open the RocksDB path positional argument; adding
+  `--object-store` to them is a follow-up, not a silent half-migration.
+* **S3 client from the environment**: `AmazonS3Builder::from_env().with_bucket_name(..).with_prefix(..)`
+  rather than `object_store::parse_url`, because `parse_url` ignores `AWS_*` environment
+  credentials. `AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_REGION` therefore behave as in the rest of the object_store ecosystem.
+* **Read-only opens never fence a writer**: `DbReader` in `FollowLatest` mode, so a replica can read
+  a live database. Mutations fail with "this store was opened read-only, it cannot be modified".
+* **Retries are per-statement, not per-transaction**: write batches and `clear` replay from their
+  operation list under a process-wide commit lock (D6); a readable `Store` transaction commits once
+  and reports a conflict instead of replaying, because SlateDB's `commit` consumes the transaction
+  and its reads cannot be replayed.
+* **Verification by pairwise iteration** instead of dumping both stores to sorted N-Quads files:
+  same guarantee, O(1) memory, no temporary files.
+* **Migration batching is 10 000 entries** (the plan said 1M): a batch is held in memory twice
+  (operations plus the encoded `WriteBatch`), and 10k keeps the peak bounded; the migration of the
+  test fixture is a fraction of a second either way.
 
 ---
 
@@ -847,7 +889,35 @@ fixtures; nothing equivalent is meaningful for a new backend, so instead pin a *
 `test_slatedb_backward_compatibility` that opens it twice and asserts stable content. This is what
 catches an accidental key-layout change later.
 
+Where the rows are asserted:
+
+| row | test |
+|---|---|
+| store integration tests, read-your-own-writes, snapshot isolation, `backup()` | `tests/store_slatedb.rs` (33 tests, the on-disk subset of `tests/store.rs`) |
+| `validate()` | after every mutating SlateDB test |
+| N-Quads dump equality | `test_dump_matches_the_other_backends` (memory, RocksDB and SlateDB, same dataset, sorted N-Quads) |
+| RDF-star / `rdf-12` triple terms | `test_slatedb_rdf_star_backward_compatibility` on `tests/slatedb_bc_rdf_star_data` |
+| second writer | `a_second_writer_fences_the_first` in `tests/slatedb_faults.rs` (two processes, D9) |
+| `clear()` cost | documented and measured, not asserted: `test_clear_above_the_limit_errors` covers the guard |
+
+How the two fixtures were generated, and why not exactly as written above:
+
+* `tests/slatedb_fixture_data` is the migration of `tests/rocksdb_bc_data` (89 keys). The RocksDB
+  fixture predates the current column families: `Store::open` creates them, but a read-only open —
+  which is what migration binds — fails with `Column family not found: graphs`. So the fixture was
+  copied, opened read-write once to bring it to the current format, and migrated from that copy.
+* `tests/slatedb_bc_rdf_star_data` is the migration of a freshly written RocksDB store holding the
+  same eight quads as `test_rdf_star_backward_compatibility`, because the committed
+  `tests/rocksdb_bc_rdf_star_data` fails `Store::validate()` under the current code
+  (`Quad in dspo and not in dpos`) — a pre-existing property of that fixture, unrelated to SlateDB.
+  A fresh store is exactly what pins the current encoding, which is the point of the fixture.
+
 ### 8.2 Fault injection
+
+Implemented in `src/storage/slatedb_faults.rs` (object store wrapper, unit tests) and
+`tests/slatedb_faults.rs` (separate processes: SIGKILL, fencing, interrupted migration; unix only).
+The process tests re-run the test binary with `--exact child_process` and a mode in an environment
+variable, and SIGKILL it with `libc::kill`. State:
 
 * `ErroringObjectStore`: a `dyn ObjectStore` wrapper that fails every `n`-th `put`/`get` with
   `object_store::Error::Generic`. Tests: open failure, mid-commit failure (no partial visibility),
@@ -860,6 +930,15 @@ catches an accidental key-layout change later.
 * Fencing: two writers in two processes, assert the first fails cleanly and the second keeps
   working (D9).
 * Interrupted migration: kill mid-import, resume, `validate()` + dump equality.
+
+Asserted by `a_failed_open_leaves_no_database`, `a_failed_commit_is_not_partially_visible_after_a_reopen`,
+`a_commit_retries_a_transient_object_store_failure`, `a_failed_scan_yields_one_error_and_ends_the_iterator`,
+`committed_writes_survive_a_sigkill`, `a_flush_free_exit_leaves_a_replayable_wal`,
+`a_second_writer_fences_the_first` and `an_interrupted_migration_resumes_into_a_valid_store`.
+Two limits, recorded rather than hidden: a failed commit with retries disabled leaves the writer
+unusable until the database is reopened (SlateDB marks it unavailable), and the interrupted
+migration test kills the child after 20 ms, so on a fast machine the copy may already be over when
+the signal arrives — the resume assertions hold either way, but the interruption is not guaranteed.
 
 ### 8.3 Observability
 
@@ -881,9 +960,22 @@ crate-wide decision that this integration should not force. Scope decision:
   (D8), backup semantics (D11), no-op `optimize()` (D12), performance table from Phase 3.
 * `CHANGELOG.md` entry under a new "Added" section.
 * RocksDB stays the default feature and the default backend until the matrix above is green.
-* Exit criteria: every row of §8.1 asserted, fault-injection suite green in CI (Linux; object-store
-  tests optionally skipped elsewhere), documentation merged, no unresolved data-loss or
-  transaction-consistency issue.
+
+Phase 5 exit criteria:
+
+- [x] Every row of §8.1 asserted, or documented as measured-only, with the tests named above.
+- [x] Fault-injection suite green in CI on Linux: new `test_slatedb` job in
+      `.github/workflows/tests.yml` runs `--lib`, `--test store_slatedb` and `--test slatedb_faults`
+      with `--features slatedb`, and the clippy job gained a `--features slatedb` run. The S3 test
+      stays `#[ignore]`d and the process tests are unix only; macOS and Windows do not run them.
+- [x] Documentation merged: `docs/slatedb.md` (locations, S3/RustFS, read-only, behaviour changes,
+      performance table, migration), `lib/oxigraph/README.md`, `CHANGELOG.md`, and the measured
+      pages under `planning/slatedb/`.
+- [x] No unresolved data-loss or transaction-consistency issue: commits are retried under D6,
+      `Wal` durability is asserted across SIGKILL, a failed commit is not partially visible after a
+      reopen, a second writer is fenced instead of both writing, and a migrated database is
+      compared quad by quad. The known gap is the S3 path, implemented but not run against a real
+      bucket (§7.5).
 
 ---
 
@@ -916,7 +1008,7 @@ Phase 3 and Phase 4 can proceed in parallel once Phase 2 is green; Phase 5 needs
 | Q5 | Does `WriteHandle::await_durable()` survive `SIGKILL` immediately after return (object PUT completed)? | Phase 3 | fault-injection test |
 | Q6 | Is there any public range-delete API in the pinned version (0.18 `WriteBatch` has none)? | Phase 2 (D7) | `cargo doc -p slatedb --no-deps` |
 | Q7 | One-shot compactor entry point for `optimize()` | Phase 3 (D12) | same |
-| Q8 | Does `Db::snapshot()` pin manifest/SST versions such that long-lived query iterators delay GC unacceptably? | Phase 5 | measure with a 10-minute-held snapshot during heavy writes |
+| Q8 | Does `Db::snapshot()` pin manifest/SST versions such that long-lived query iterators delay GC unacceptably? **Resolved: no.** GC deletes by age (`wal` 60 s, `compacted`/`manifest` 24 h), not by snapshots. Measured with a 73 s-held iterator during writes: still complete. Limits and tuning are in `performance.md`. | Phase 5 | done |
 
 ---
 
