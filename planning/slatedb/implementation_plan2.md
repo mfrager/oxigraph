@@ -692,7 +692,8 @@ Benchmarks to add in the split targets from §4.2 (already criterion-based via
    7. delete a 100 k-quad graph, 8. cold reopen time.
 
 Reported in `planning/slatedb/performance.md`, including object-store request counts. **No claim
-of a speedup without a number in that table.**
+of a speedup without a number in that table.** The post-Phase-5 follow-up work on the measured
+bottlenecks is planned in `optimization_plan1.md`.
 
 ### 6.5 Phase 3 exit criteria
 
