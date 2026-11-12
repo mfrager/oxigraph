@@ -281,6 +281,57 @@ fn measure_a_held_iterator() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Measures the latency of one single-quad commit for several `flush_interval` values, with the
+/// default `Wal` durability (planning/slatedb/optimization_plan1.md, O5).
+///
+/// With `Wal` durability a commit answers once its write-ahead log entry is durable, and the log is
+/// flushed at most every `flush_interval`, so a small commit mostly waits for the next flush. The
+/// second line of each round measures one commit carrying 10 000 quads, which amortizes that wait.
+///
+/// Ignored by default because it takes a while; run it with
+/// `cargo test -p oxigraph --features slatedb --test store_slatedb --release -- --ignored --nocapture
+/// measure_commit_latency_by_flush_interval`.
+#[test]
+#[ignore = "waits for tens of WAL flushes, run it with --ignored to measure the commit latency"]
+#[expect(clippy::print_stdout, reason = "the measurement is its output")]
+fn measure_commit_latency_by_flush_interval() -> Result<(), Box<dyn Error>> {
+    const COMMITS: u32 = 20;
+    let quad = |i: u32| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/s{i}")),
+            NamedNode::new_unchecked("http://example.com/p"),
+            Literal::new_simple_literal(format!("value{i}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    for flush_interval in [100, 20, 5, 1] {
+        let dir = TempDir::new()?;
+        let store = Store::open_with_slate_db(
+            SlateDbOptions::at_directory(dir.path())
+                .with_flush_interval(Duration::from_millis(flush_interval)),
+        )?;
+        // The first commit also creates the database metadata: keep it out of the measurement.
+        store.insert(quad(0))?;
+        let started = Instant::now();
+        for i in 1..=COMMITS {
+            store.insert(quad(i))?;
+        }
+        println!(
+            "flush_interval {flush_interval:>3} ms: {:.1} ms per single-quad commit",
+            (started.elapsed() / COMMITS).as_secs_f64() * 1_000.0
+        );
+
+        let started = Instant::now();
+        store.extend(generated_quads(10_000, None))?;
+        println!(
+            "flush_interval {flush_interval:>3} ms: one commit of 10 000 quads took {:.1} ms",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+        store.flush()?;
+    }
+    Ok(())
+}
+
 #[test]
 fn test_dump_matches_the_other_backends() -> Result<(), Box<dyn Error>> {
     let memory = Store::new()?;

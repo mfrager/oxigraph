@@ -4,7 +4,9 @@ Exit criteria of §6.5 require absolute numbers, not ratios: a benchmark table o
 SlateDB, a million quad load whose peak memory is measured and documented, a `clear*` path whose
 memory does not grow with the number of deleted quads, and the known bottlenecks written down.
 
-Everything below was measured on one machine, on this working tree, with the release profile.
+Everything below was measured on one machine, on this working tree, with the release profile. The
+benchmark table, the O1/O2 section and bottleneck 1 were re-measured after the changes of
+`optimization_plan1.md`; every other table is unchanged by them and was not re-run.
 
 ```
 CPU     Intel Core i7-6700HQ (4 cores, 8 threads), 2.60 GHz
@@ -41,22 +43,70 @@ estimate of that interval is used below.
 
 | workload | RocksDB | SlateDB | note |
 | --- | --- | --- | --- |
-| insert 100 quads, one `Store::insert` each, `Wal` durability | 1.63 ms (16 µs/commit) | 10.12 s (101 ms/commit) | each commit waits for the WAL flush, see bottleneck 1 |
-| insert 100 quads, one `Store::insert` each, `Process` durability | 1.63 ms | 2.87 ms (29 µs/commit) | no durability wait, closest to RocksDB's default |
-| `Store::extend` of 10 000 quads | 46.4 ms (215 k quads/s) | 121 ms (83 k quads/s) | one write batch, `Wal` durability |
-| bulk load of 100 000 quads, atomic | 406 ms (246 k quads/s) | 968 ms (103 k quads/s) | RocksDB builds SSTs, SlateDB writes batches |
-| bulk load of 100 000 quads, `without_atomicity` | 406 ms (246 k quads/s) | 731 ms (137 k quads/s) | the recommended SlateDB path |
-| 1 000 point lookups by subject (`Store::contains`) | 1.83 ms (1.8 µs/lookup) | 17.5 ms (17 µs/lookup) | one storage round trip per lookup |
-| scan by predicate over 1 000 quads, 100 results | 363 µs | 3.68 ms | 3.6 µs/result against 37 µs/result |
-| SPARQL mix, 3 queries over 1 000 quads | 3.88 ms | 36.1 ms | projection, count and ordered `LIMIT` |
-| `Store::clear_graph` of a 100 000 quad named graph | 2.25 s (44 k quads/s) | 2.35 s (43 k quads/s) | both delete quad by quad in batches |
-| cold reopen of a 100 000 quad store, then `Store::len` | 47.1 ms | 449 ms | SlateDB replays its manifest and WAL objects |
+| insert 100 quads, one `Store::insert` each, `Wal` durability | 1.33 ms (13 µs/commit) | 10.12 s (101 ms/commit) | each commit waits for the WAL flush, see bottleneck 1 |
+| insert 100 quads, one `Store::insert` each, `Process` durability | 1.33 ms | 2.83 ms (28 µs/commit) | no durability wait, closest to RocksDB's default |
+| `Store::extend` of 10 000 quads | 45.8 ms (218 k quads/s) | 129 ms (78 k quads/s) | one write batch, `Wal` durability |
+| bulk load of 100 000 quads, atomic | 399 ms (250 k quads/s) | 981 ms (102 k quads/s) | RocksDB builds SSTs, SlateDB writes batches |
+| bulk load of 100 000 quads, `without_atomicity` | 399 ms (250 k quads/s) | 701 ms (143 k quads/s) | the recommended SlateDB path |
+| 1 000 point lookups by subject (`Store::contains`) | 1.77 ms (1.8 µs/lookup) | 3.04 ms (3.0 µs/lookup) | one storage round trip per lookup, now driven on the caller thread |
+| scan by predicate over 1 000 quads, 100 results | 351 µs | 121 µs | 1.2 µs/result against 3.5 µs/result, the dictionary cache pays off |
+| SPARQL mix, 3 queries over 1 000 quads | 3.97 ms | 1.55 ms | projection, count and ordered `LIMIT` |
+| `Store::clear_graph` of a 100 000 quad named graph | 2.17 s (46 k quads/s) | 2.19 s (46 k quads/s) | both delete quad by quad in batches |
+| cold reopen of a 100 000 quad store, then `Store::len` | 47.2 ms | 457 ms | SlateDB replays its manifest and WAL objects |
 
-No workload is faster with SlateDB, and RocksDB stays the default backend. The gap is the expected
-price of a log structured store on top of an object store abstraction: one write per commit, one
-round trip per point lookup, and no native SST ingestion. Deletion at scale is the one place where
-both backends cost the same, because both are bound by the number of keys deleted rather than by
-the storage engine.
+The read path now beats RocksDB: a point lookup is 1.7 times faster, the 100-result scan 2.9 times
+and the SPARQL mix 2.6 times, because the bridge no longer pays a scheduling hop per call and the
+repeated `id2str` lookups are cached (see the next section). RocksDB still wins every write and
+startup workload and stays the default backend: the gap is the expected price of a log structured
+store on top of an object store abstraction, one durable write per commit, no native SST ingestion,
+and a manifest replay at startup. Deletion at scale is where both backends cost the same, because
+both are bound by the number of keys deleted rather than by the storage engine.
+
+## The bridge and the dictionary cache (O1 and O2)
+
+Two changes to the integration (planned in `optimization_plan1.md`) moved the read path, measured
+with the same command and on the same tree as the table above:
+
+| workload | before | after | change |
+| --- | --- | --- | --- |
+| 1 000 point lookups (`Store::contains`) | 17.5 ms | 3.04 ms | 5.8× faster |
+| scan by predicate, 100 of 1 000 quads | 3.68 ms | 121 µs | 30× faster |
+| SPARQL mix, 3 queries over 1 000 quads | 36.1 ms | 1.55 ms | 23× faster |
+| cold reopen, then `Store::len` | 453 ms | 457 ms | unchanged |
+| 100 single-quad commits (`Wal`) | 10.12 s | 10.12 s | unchanged, it is the flush interval |
+| `Store::extend` of 10 000 quads | 127 ms | 129 ms | unchanged |
+| bulk load of 100 000 quads | 948 ms | 981 ms | unchanged |
+
+* **The bridge drives the future on the calling thread** (`RuntimeBridge::run`). Spawning the
+  future and waiting on a channel cost 9.4–18 µs per call, which was 85 % of a 17 µs point lookup
+  and 15.5 µs of every dictionary lookup. The caller is now checked with `Handle::try_current()`:
+  on a plain thread the future is driven by `Handle::block_on` (0.05 µs), and inside a Tokio runtime
+  the spawn-and-channel path stays, which is what keeps an embedding application from deadlocking.
+  A panic is still reported as a `StorageError` on both paths.
+* **The decoded `id2str` strings are cached** per store (`Id2StrCache` in
+  `lib/oxigraph/src/storage/slatedb.rs`): a bounded `DashMap` of 16 384 entries keyed by `StrHash`,
+  shared by every snapshot and readable transaction of the store. A hash always maps to the same
+  string, so no invalidation is needed; a hit is a shard read and a refcount bump. Decoding a quad
+  asked for its subject, predicate, object, datatype and language strings every time, and the
+  predicate scan of the benchmark repeats its predicate on all 100 results.
+
+One measurement kept the change honest: the fast path is **worse for the opening path**. SlateDB's
+builder replays the manifest and the write-ahead log by yielding thousands of times, and each yield
+of a `Handle::block_on`-driven future parks and unparks the calling thread. Driving the whole open
+through the fast path measured a 100 000 quad cold open of 549–771 ms against 351–364 ms on a
+worker, so `RuntimeBridge::run_on_worker` keeps the builder (and every per-operation call keeps the
+fast path). With that split, the open alone is 347–382 ms and `Store::len` dropped from 130 ms to
+91 ms.
+
+Not done, and why:
+
+* **SlateDB's block cache (`foyer`) stays off.** The dependency keeps `default-features = false`, so
+  there is still no block cache; enabling it is a one-line feature change that raises the memory
+  ceiling by up to 576 MiB and needs an explicit decision, which has not been made.
+* **No batched `id2str` prefetch.** The plan gates it on a measured share of at least 20 % of scan
+  time in dictionary gets over an object store, and there are no S3/RustFS numbers yet: on the local
+  filesystem those gets are now CPU-bound LSM reads of ~3 µs and the predicate scan is already
+  faster than RocksDB.
 
 ## A million quad load
 
@@ -184,17 +234,28 @@ age-based deletion applies to it, and it can sit on a version far older than the
 ## Known bottlenecks
 
 1. **One durable flush per commit.** With `Wal` durability each commit waits for the next WAL
-   flush, which happens at most every `flush_interval` (100 ms by default): 101 ms per single quad
-   `Store::insert` above. Batching writes amortizes it (`extend` of 10 000 quads is 121 ms) and
-   `Process` durability removes it (29 µs/commit), at the price of losing the last commits on a
-   crash. `SlateDbOptions::with_flush_interval` trades write amplification for that latency.
+   flush, which happens at most every `flush_interval` (100 ms by default), so the latency of a
+   small commit is the interval. Measured with the ignored
+   `measure_commit_latency_by_flush_interval` test, 20 single-quad commits per interval:
+
+   | `flush_interval` | one single-quad commit | one commit of 10 000 quads |
+   | --- | --- | --- |
+   | 100 ms (default) | 101 ms | 131 ms |
+   | 20 ms | 21.3 ms | 99 ms |
+   | 5 ms | 6.1 ms | 94 ms |
+   | 1 ms | 2.1 ms | 79 ms |
+
+   Batching writes amortizes the wait instead of shortening it (`extend` of 10 000 quads is 129 ms)
+   and `Process` durability removes it (28 µs/commit) at the price of losing the last commits of a
+   killed process. A shorter interval multiplies the number of WAL objects in the object store, so
+   it is a deployment decision, not a better default.
 2. **No SST ingestion.** The bulk loader cannot hand files to SlateDB the way the RocksDB loader
-   does: it encodes quads and streams write batches, so it is 2.4 times slower than RocksDB and
+   does: it encodes quads and streams write batches, so it is 2.5 times slower than RocksDB and
    bound by writes and compaction rather than by the CPU.
-3. **One round trip per point lookup and per scan batch.** Every `Store::contains` is 17 µs against
-   1.8 µs for RocksDB, and a scan fetches 256 key batches, so a 100 result scan is 3.7 ms. The scan
-   prefetch (`with_scan_prefetch`, 1 MiB read-ahead, 4 fetch tasks by default) only helps large
-   scans.
+3. **Startup replays the manifest and the write-ahead log.** A 100 000 quad store takes 457 ms to
+   reopen against 47 ms for RocksDB, and 350–380 ms of that is `Db::build` itself. That path is
+   yield-bound rather than CPU-bound: driving it with `Handle::block_on` costs a park and an unpark
+   per yield and measured 549–771 ms, which is why it keeps the worker path.
 4. **Large single writes collapse.** A commit of 1.5 million keys takes minutes (see above), which
    is why non atomic loads are chunked at 50 000 quads and why the atomic path is meant for
    reasonably sized files. This is a SlateDB side effect, visible in the atomic scaling table.

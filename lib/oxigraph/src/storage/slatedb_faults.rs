@@ -295,7 +295,7 @@ fn a_failed_scan_yields_one_error_and_ends_the_iterator() {
     faults.fail_gets(0);
     let mut scan = SlateDbScanState::new(storage.try_scan(Ns::Spog, b""));
     let items: Vec<_> = std::iter::from_fn(|| scan.next_key_value()).collect();
-    assert_eq!(items.len(), 2, "the scan should see both keys");
+    assert_eq!(items.len(), 2, "the scan should see both keys: {items:?}");
     assert!(items.iter().all(Result::is_ok));
     storage.close().unwrap();
 }

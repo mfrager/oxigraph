@@ -2394,6 +2394,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxigraph-s3-runner"
+version = "0.6.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dotenvy",
+]
+
+[[package]]
 name = "oxigraph-testsuite"
 version = "0.0.0"
 dependencies = [

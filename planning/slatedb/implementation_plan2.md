@@ -1018,7 +1018,7 @@ Phase 3 and Phase 4 can proceed in parallel once Phase 2 is green; Phase 5 needs
 | Risk | Impact | Mitigation |
 |---|---|---|
 | `slatedb` is pre-1.0; API churn between 0.18 and later | build breakage | pin `=0.18.x`; all SlateDB contact confined to three files |
-| Per-scan bridge overhead dominates cheap SPARQL scans | query latency | batched pull (256); measure in Phase 3; channel prefetcher if > 5 % |
+| Per-scan bridge overhead dominates cheap SPARQL scans | query latency | **closed**: `optimization_plan1.md` O1 drives the future on the calling thread, 17.5 ms → 3.04 ms for 1 000 point lookups and 3.68 ms → 121 µs for the 100-result scan |
 | `clear()` O(n) regression | admin operations | guard + documentation; epoch layout is the escape hatch (D10), decided before data exists |
 | Atomic bulk load memory | large imports | explicit budget + error (D8); `without_atomicity()` documented |
 | No SST ingest ⇒ slower bulk load than RocksDB | user expectation | measure and publish; never claim parity |

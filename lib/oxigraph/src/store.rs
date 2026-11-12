@@ -40,6 +40,11 @@ pub use crate::storage::{SlateDbDurability, SlateDbObjectStore, SlateDbOptions};
 /// so `Settings::from_file` and its fields are available without mirroring them.
 #[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
 pub use slatedb::config::Settings as SlateDbSettings;
+/// The object stores of the SlateDB backend, re-exported from the `object_store` crate: an
+/// application builds the client handed to [`SlateDbOptions::at_object_store`] from here, which
+/// keeps it on the version SlateDB itself uses.
+#[cfg(all(not(target_family = "wasm"), feature = "slatedb"))]
+pub use slatedb::object_store;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb", feature = "slatedb"))]
 pub use crate::storage::migration::MigrationReport;
 #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]

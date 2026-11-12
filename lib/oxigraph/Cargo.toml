@@ -60,6 +60,9 @@ slatedb = { version = "0.18", optional = true, default-features = false, feature
 ] }
 url = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
+  # `net` and the I/O driver of the runtime are needed by the S3 client of SlateDB, which opens
+  # TCP connections from the worker threads of the bridge.
+  "net",
   "rt-multi-thread",
   "sync",
   "time",

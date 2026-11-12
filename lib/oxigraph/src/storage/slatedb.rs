@@ -17,12 +17,13 @@ use crate::storage::binary_encoder::{
 };
 use crate::storage::error::{CorruptionError, StorageError};
 use crate::storage::numeric_encoder::{
-    Decoder, EncodedQuad, EncodedTerm, StrHash, StrLookup, insert_term,
+    Decoder, EncodedQuad, EncodedTerm, StrHash, StrHashHasher, StrLookup, insert_term,
 };
 use crate::storage::bulk_encoder::BatchedKeys;
 use crate::storage::slatedb_bridge::RuntimeBridge;
 use crate::storage::slatedb_keyspace::{Ns, prefix_bounds, prefixed, strip_prefix};
 use crate::storage::map_thread_result;
+use dashmap::DashMap;
 use slatedb::bytes::Bytes;
 use slatedb::config::{CompressionCodec, ScanOptions, Settings};
 use slatedb::object_store::ObjectStore;
@@ -37,6 +38,7 @@ use spareval::CancellationToken;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::future::Future;
+use std::hash::BuildHasherDefault;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::Utf8Error;
@@ -121,7 +123,9 @@ pub enum SlateDbObjectStore {
     ///
     /// Credentials and endpoints of S3 do not go through this URL: they are read from the usual
     /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or `AWS_DEFAULT_REGION`),
-    /// `AWS_ENDPOINT` and `AWS_ALLOW_HTTP` environment variables, exactly like the AWS CLI.
+    /// `AWS_ENDPOINT` and `AWS_ALLOW_HTTP` environment variables, exactly like the AWS CLI. To set
+    /// them in code instead, build the client yourself and hand it to
+    /// [`SlateDbOptions::at_object_store`].
     Url(String),
 }
 
@@ -179,6 +183,32 @@ impl SlateDbObjectStore {
     }
 }
 
+/// Where the database lives, once [`SlateDbOptions`] is built: either a location an object store is
+/// built from, or a store the caller built itself.
+#[derive(Clone, Debug)]
+enum SlateDbLocation {
+    /// A directory or a URL, turned into an object store by [`SlateDbObjectStore::open`].
+    Described(SlateDbObjectStore),
+    /// An object store the caller built, and the prefix of the database inside it.
+    Built {
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+    },
+}
+
+impl SlateDbLocation {
+    /// Builds the object store and the path of the database inside it.
+    fn open(&self, prefix: &str) -> Result<(Arc<dyn ObjectStore>, ObjectStorePath), StorageError> {
+        match self {
+            Self::Described(location) => location.open(prefix),
+            Self::Built {
+                store,
+                prefix: path,
+            } => Ok((Arc::clone(store), database_path(&join_path(path, prefix))?)),
+        }
+    }
+}
+
 /// Appends `suffix` to the `prefix` path of a URL.
 fn join_path(prefix: &str, suffix: &str) -> String {
     let prefix = prefix.trim_matches('/');
@@ -204,7 +234,7 @@ fn database_path(prefix: &str) -> Result<ObjectStorePath, StorageError> {
 /// Location, tuning and durability of a SlateDB database.
 #[derive(Clone, Debug)]
 pub struct SlateDbOptions {
-    object_store: SlateDbObjectStore,
+    location: SlateDbLocation,
     prefix: String,
     durability: SlateDbDurability,
     settings: Settings,
@@ -220,7 +250,7 @@ impl Default for SlateDbOptions {
     /// [`SlateDbOptions::at_url`], which say where the database lives.
     fn default() -> Self {
         Self {
-            object_store: SlateDbObjectStore::Directory(PathBuf::new()),
+            location: SlateDbLocation::Described(SlateDbObjectStore::Directory(PathBuf::new())),
             prefix: String::new(),
             durability: SlateDbDurability::default(),
             settings: default_settings(),
@@ -238,7 +268,7 @@ impl SlateDbOptions {
     #[must_use]
     pub fn at_directory(path: impl Into<PathBuf>) -> Self {
         Self {
-            object_store: SlateDbObjectStore::Directory(path.into()),
+            location: SlateDbLocation::Described(SlateDbObjectStore::Directory(path.into())),
             ..Self::default()
         }
     }
@@ -246,16 +276,54 @@ impl SlateDbOptions {
     /// Stores the database in an object store, described by an `s3://bucket/prefix` or
     /// `file:///absolute/path` URL.
     ///
-    /// S3 credentials, region and endpoint come from the `AWS_*` environment variables.
+    /// S3 credentials, region and endpoint come from the `AWS_*` environment variables; to set them
+    /// in code instead, see [`Self::at_object_store`].
     #[must_use]
     pub fn at_url(url: impl Into<String>) -> Self {
         Self {
-            object_store: SlateDbObjectStore::Url(url.into()),
+            location: SlateDbLocation::Described(SlateDbObjectStore::Url(url.into())),
             ..Self::default()
         }
     }
 
-    /// Adds a path inside the object store above the one the URL or directory describes.
+    /// Stores the database in an object store the caller built, at `prefix` inside it.
+    ///
+    /// This is how a client reaches settings that the `AWS_*` environment variables of
+    /// [`Self::at_url`] cannot express: credentials kept outside the environment, an endpoint or
+    /// region per database instead of per process, a proxy, a timeout, or the local disk cache of
+    /// [`ClientOptions`](slatedb::object_store::ClientOptions). The bucket belongs to the client
+    /// here, and the same client may be shared by several databases at different prefixes.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use oxigraph::store::{object_store, SlateDbOptions, Store};
+    /// # use object_store::aws::AmazonS3Builder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = AmazonS3Builder::new()
+    ///     .with_bucket_name("bucket")
+    ///     .with_region("us-east-1")
+    ///     .with_endpoint("http://localhost:9000")
+    ///     .with_allow_http(true)
+    ///     .with_access_key_id("…")
+    ///     .with_secret_access_key("…")
+    ///     .build()?;
+    /// let _store =
+    ///     Store::open_with_slate_db(SlateDbOptions::at_object_store(Arc::new(client), "db"))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn at_object_store(store: Arc<dyn ObjectStore>, prefix: impl Into<String>) -> Self {
+        Self {
+            location: SlateDbLocation::Built {
+                store,
+                prefix: prefix.into(),
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Adds a path inside the object store above the prefix of the location.
     #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
@@ -350,9 +418,9 @@ impl SlateDbOptions {
     }
 
     /// Splits the options into the location to open and the settings used at runtime.
-    fn into_parts(self) -> (SlateDbObjectStore, String, SlateDbConfig) {
+    fn into_parts(self) -> (SlateDbLocation, String, SlateDbConfig) {
         let Self {
-            object_store,
+            location,
             prefix,
             durability,
             settings,
@@ -363,7 +431,7 @@ impl SlateDbOptions {
             scan_options,
         } = self;
         (
-            object_store,
+            location,
             prefix,
             SlateDbConfig {
                 durability,
@@ -445,6 +513,65 @@ impl SlateDbHandle {
     }
 }
 
+/// Number of decoded `id2str` entries kept per store.
+///
+/// 16 384 (`0x4000`) entries is a few megabytes at most (the hash, the string and its allocation)
+/// and covers the repeated terms of any realistic query mix; see [`Id2StrCache`].
+const ID2STR_CACHE_CAPACITY: usize = 0x4000;
+
+/// A bounded cache of the decoded strings of the `id2str` keyspace.
+///
+/// Every hashed RDF term of a quad costs one `id2str` read while scanning, and the same predicates,
+/// classes, datatypes and language tags come back quad after quad and query after query. The cache
+/// is content addressed: an `id2str` key is a [`StrHash`], so the stored string of a hash never
+/// changes and no invalidation is needed for inserts, deletes, clears, rollbacks, flushes or a
+/// readable transaction's own writes. A cached value is therefore exactly as correct as the store's
+/// own "a hash identifies a string" assumption.
+///
+/// It is shared by every reader of one store, not one cache per query or per reader.
+struct Id2StrCache {
+    /// Same shape as the in-memory backend's dictionary (`storage/memory.rs`): a `DashMap` keyed by
+    /// `StrHash` with `StrHashHasher`, so a hit is a shard read and a refcount bump.
+    entries: DashMap<StrHash, OxString, BuildHasherDefault<StrHashHasher>>,
+}
+
+impl Id2StrCache {
+    fn new() -> Self {
+        Self {
+            entries: DashMap::default(),
+        }
+    }
+
+    fn get(&self, key: &StrHash) -> Option<OxString> {
+        self.entries.get(key).map(|entry| entry.value().clone())
+    }
+
+    /// Stores `value` for `key`, dropping an arbitrary entry first if the cache is full.
+    ///
+    /// Random replacement rather than LRU or FIFO: it is O(1), needs no second lock and no
+    /// per-hit bookkeeping, and the workload that overflows the cache is a scan of distinct terms,
+    /// where the eviction policy barely matters.
+    fn insert(&self, key: StrHash, value: OxString) {
+        // The victim is looked up in its own statement: an `iter()` temporary lives until the end
+        // of the statement that contains it, and holding its shard read guard across the `remove`
+        // below would deadlock on the write guard of the same shard.
+        let victim = if self.entries.len() >= ID2STR_CACHE_CAPACITY {
+            self.entries.iter().next().map(|entry| *entry.key())
+        } else {
+            None
+        };
+        if let Some(victim) = victim {
+            self.entries.remove(&victim);
+        }
+        self.entries.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// A single SlateDB database holding every Oxigraph keyspace.
 #[derive(Clone)]
 pub(crate) struct SlateDbStorage {
@@ -452,6 +579,8 @@ pub(crate) struct SlateDbStorage {
     // Declared after `handle` so that the runtime outlives the SlateDB tasks it drives.
     bridge: Arc<RuntimeBridge>,
     config: Arc<SlateDbConfig>,
+    /// Decoded `id2str` values, shared with every reader of this store.
+    id2str_cache: Arc<Id2StrCache>,
 }
 
 impl SlateDbStorage {
@@ -459,7 +588,7 @@ impl SlateDbStorage {
     #[cfg(any(not(feature = "rocksdb"), test))]
     pub(crate) fn open_at(path: &Path) -> Result<Self, StorageError> {
         Self::open_configured(
-            &SlateDbObjectStore::Directory(path.to_path_buf()),
+            &SlateDbLocation::Described(SlateDbObjectStore::Directory(path.to_path_buf())),
             "",
             SlateDbConfig::default(),
         )
@@ -484,7 +613,7 @@ impl SlateDbStorage {
     }
 
     fn open_configured(
-        location: &SlateDbObjectStore,
+        location: &SlateDbLocation,
         prefix: &str,
         config: SlateDbConfig,
     ) -> Result<Self, StorageError> {
@@ -502,7 +631,7 @@ impl SlateDbStorage {
         let handle = if config.read_only {
             // A reader never takes the writer role, so opening a database read-only does not fence
             // the process writing it (planning/slatedb/implementation_plan2.md, D9).
-            let reader = run_slatedb(&bridge, async move {
+            let reader = run_slatedb_on_worker(&bridge, async move {
                 DbReader::builder(path, object_store)
                     .with_reader_mode(DbReaderMode::FollowLatest)
                     .build()
@@ -511,7 +640,7 @@ impl SlateDbStorage {
             SlateDbHandle::ReadOnly(Arc::new(reader))
         } else {
             let settings = config.settings.clone();
-            let db = run_slatedb(&bridge, async move {
+            let db = run_slatedb_on_worker(&bridge, async move {
                 Db::builder(path, object_store)
                     .with_settings(settings)
                     .build()
@@ -523,6 +652,7 @@ impl SlateDbStorage {
             handle,
             bridge,
             config: Arc::new(config),
+            id2str_cache: Arc::new(Id2StrCache::new()),
         };
         storage.check_meta()?;
         Ok(storage)
@@ -641,6 +771,7 @@ impl SlateDbStorage {
             source,
             bridge: Arc::clone(&self.bridge),
             scan_options: Arc::clone(&self.config.scan_options),
+            id2str_cache: Arc::clone(&self.id2str_cache),
         }
     }
 
@@ -707,6 +838,7 @@ impl SlateDbStorage {
             db,
             bridge: Arc::clone(&self.bridge),
             config: Arc::clone(&self.config),
+            id2str_cache: Arc::clone(&self.id2str_cache),
             clear_deleted: 0,
         })
     }
@@ -776,6 +908,7 @@ pub(crate) struct SlateDbStorageReader {
     source: SlateDbReadSource,
     bridge: Arc<RuntimeBridge>,
     scan_options: Arc<ScanOptions>,
+    id2str_cache: Arc<Id2StrCache>,
 }
 
 #[derive(Clone)]
@@ -1355,11 +1488,20 @@ impl SlateDbStorageReader {
 
 impl StrLookup for SlateDbStorageReader {
     fn get_str(&self, key: &StrHash) -> Result<Option<OxString>, StorageError> {
-        Ok(self
+        if let Some(value) = self.id2str_cache.get(key) {
+            return Ok(Some(value));
+        }
+        let value = self
             .get(Ns::Id2Str, &key.to_be_bytes())?
             .map(|v| Ok::<_, Utf8Error>(OxString::new_owned(str::from_utf8(&v)?)))
             .transpose()
-            .map_err(CorruptionError::new)?)
+            .map_err(CorruptionError::new)?;
+        // Misses and invalid values are not cached, so a corrupted entry keeps failing on every
+        // read like it does without the cache.
+        if let Some(value) = &value {
+            self.id2str_cache.insert(*key, value.clone());
+        }
+        Ok(value)
     }
 }
 
@@ -1950,6 +2092,8 @@ pub(crate) struct SlateDbStorageReadableTransaction {
     db: Arc<Db>,
     bridge: Arc<RuntimeBridge>,
     config: Arc<SlateDbConfig>,
+    /// The store's `id2str` cache, so that every reader of this transaction shares it.
+    id2str_cache: Arc<Id2StrCache>,
     /// Number of keys deleted by the range deletes of this transaction, checked against
     /// [`SlateDbOptions::with_max_clear_deletes`].
     clear_deleted: u64,
@@ -1963,6 +2107,7 @@ impl SlateDbStorageReadableTransaction {
             ))),
             bridge: Arc::clone(&self.bridge),
             scan_options: Arc::clone(&self.config.scan_options),
+            id2str_cache: Arc::clone(&self.id2str_cache),
         }
     }
 
@@ -2460,6 +2605,19 @@ where
     bridge.run(future)?.map_err(map_slatedb_error)
 }
 
+/// Like [`run_slatedb`], but always on a bridge worker: the opening path replays the whole manifest
+/// and write-ahead log, and [`RuntimeBridge::run_on_worker`] documents why that future must not be
+/// driven by `Handle::block_on`.
+fn run_slatedb_on_worker<T>(
+    bridge: &RuntimeBridge,
+    future: impl Future<Output = Result<T, slatedb::Error>> + Send + 'static,
+) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+{
+    bridge.run_on_worker(future)?.map_err(map_slatedb_error)
+}
+
 /// Runs a future that already reports [`StorageError`]s, for the paths that mix SlateDB calls with
 /// the durability policy and the result codec.
 fn run_storage<T>(
@@ -2495,6 +2653,7 @@ fn map_slatedb_error(error: slatedb::Error) -> StorageError {
 mod tests {
     use super::*;
     use crate::model::NamedNode;
+    use slatedb::object_store::memory::InMemory;
     use tempfile::TempDir;
 
     fn open(directory: &TempDir) -> SlateDbStorage {
@@ -2608,6 +2767,44 @@ mod tests {
         storage.close().unwrap();
     }
 
+    /// The client handed to `at_object_store` is the one opened, at the prefix asked for: the data
+    /// is invisible from another prefix of the same client and from another client.
+    #[test]
+    fn opens_on_a_caller_built_object_store() {
+        let client: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let storage = SlateDbStorage::open_with_options(SlateDbOptions::at_object_store(
+                Arc::clone(&client),
+                "db",
+            ))
+            .unwrap();
+            storage
+                .put(Ns::Graphs, b"graph", b"<http://example.com>")
+                .unwrap();
+            storage.close().unwrap();
+        }
+
+        let storage = SlateDbStorage::open_with_options(SlateDbOptions::at_object_store(
+            Arc::clone(&client),
+            "db",
+        ))
+        .unwrap();
+        assert_eq!(
+            storage.get(Ns::Graphs, b"graph").unwrap(),
+            Some(b"<http://example.com>".to_vec())
+        );
+        storage.close().unwrap();
+
+        let fresh_client: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (client, prefix) in [(Arc::clone(&client), "another"), (fresh_client, "db")] {
+            let storage =
+                SlateDbStorage::open_with_options(SlateDbOptions::at_object_store(client, prefix))
+                    .unwrap();
+            assert_eq!(storage.get(Ns::Graphs, b"graph").unwrap(), None);
+            storage.close().unwrap();
+        }
+    }
+
     #[test]
     fn rejects_a_database_created_by_another_engine() {
         let directory = TempDir::new().unwrap();
@@ -2635,6 +2832,83 @@ mod tests {
         }
         let error = SlateDbStorage::open_at(directory.path()).err().unwrap();
         assert!(error.to_string().contains("too recent"), "{error}");
+    }
+
+    #[test]
+    fn the_id2str_cache_returns_inserted_values() {
+        let cache = Id2StrCache::new();
+        let key = StrHash::new("http://example.com/term");
+        assert!(cache.get(&key).is_none());
+        cache.insert(key, OxString::new_owned("http://example.com/term"));
+        assert_eq!(cache.get(&key).as_deref(), Some("http://example.com/term"));
+    }
+
+    #[test]
+    fn the_id2str_cache_keeps_inserted_values_below_capacity() {
+        let cache = Id2StrCache::new();
+        let keys = (0..100)
+            .map(|i| StrHash::new(&format!("http://example.com/{i}")))
+            .collect::<Vec<_>>();
+        for (i, key) in keys.iter().enumerate() {
+            cache.insert(
+                *key,
+                OxString::new_owned(&format!("http://example.com/{i}")),
+            );
+        }
+        assert_eq!(cache.len(), keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cache.get(key).as_deref(),
+                Some(format!("http://example.com/{i}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn the_id2str_cache_stays_bounded() {
+        let cache = Id2StrCache::new();
+        for i in 0..ID2STR_CACHE_CAPACITY + 1_000 {
+            let value = format!("http://example.com/{i}");
+            cache.insert(StrHash::new(&value), OxString::new_owned(&value));
+        }
+        assert!(cache.len() <= ID2STR_CACHE_CAPACITY, "{}", cache.len());
+    }
+
+    /// An `id2str` key is the hash of its value, so a cached string stays valid even after the key
+    /// is deleted: the store would never legitimately map that hash to another string.
+    #[test]
+    fn a_term_string_survives_the_term_being_deleted_and_reinserted() {
+        let directory = TempDir::new().unwrap();
+        let storage = open(&directory);
+        let hash = StrHash::new("http://example.com/survivor");
+        let key = hash.to_be_bytes();
+        storage
+            .put(Ns::Id2Str, &key, b"http://example.com/survivor")
+            .unwrap();
+
+        let reader = storage.snapshot();
+        assert_eq!(
+            reader.get_str(&hash).unwrap().as_deref(),
+            Some("http://example.com/survivor")
+        );
+
+        // A reader taken after the deletion reads no value, but the cached string is still right.
+        storage.delete(Ns::Id2Str, &key).unwrap();
+        let reader = storage.snapshot();
+        assert_eq!(
+            reader.get_str(&hash).unwrap().as_deref(),
+            Some("http://example.com/survivor")
+        );
+
+        storage
+            .put(Ns::Id2Str, &key, b"http://example.com/survivor")
+            .unwrap();
+        let reader = storage.snapshot();
+        assert_eq!(
+            reader.get_str(&hash).unwrap().as_deref(),
+            Some("http://example.com/survivor")
+        );
+        storage.close().unwrap();
     }
 
     #[test]

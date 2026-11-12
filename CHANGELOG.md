@@ -2,7 +2,7 @@
 
 ### Added
 - `sparopt`: `GraphPattern::join_order_variables`, exposing the join / variable-elimination order chosen by `Optimizer::optimize_graph_pattern` for consumption by external execution engines (e.g. worst-case-optimal join executors).
-- `oxigraph`: a SlateDB storage backend behind the `slatedb` feature, storing the database in a local directory or an S3 compatible object store (`Store::open_with_slate_db`, `Store::open_slate_db_read_only`). RocksDB stays the default backend. A `oxigraph migrate` command converts a RocksDB database, and `--object-store` selects the backend in the CLI. The behaviour changes against RocksDB and the measured performance differences are documented in [`docs/slatedb.md`](docs/slatedb.md).
+- `oxigraph`: a SlateDB storage backend behind the `slatedb` feature, storing the database in a local directory or an S3 compatible object store (`Store::open_with_slate_db`, `Store::open_slate_db_read_only`). RocksDB stays the default backend. A `oxigraph migrate` command converts a RocksDB database, and `--object-store` selects the backend in the CLI. An application may also build the object store client itself, for credentials or an endpoint that the `AWS_*` environment variables cannot describe, and hand it to `SlateDbOptions::at_object_store`. The behaviour changes against RocksDB and the measured performance differences are documented in [`docs/slatedb.md`](docs/slatedb.md).
 
 
 # [0.5.7] - 2026-04-19

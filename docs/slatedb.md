@@ -20,14 +20,17 @@ live in S3 or in an S3 compatible store (RustFS, MinIO, Ceph…) instead of a lo
 | `SlateDbOptions::at_directory(path)`   | `--location DIR` (RocksDB) or `file://`  | a directory of this machine   |
 | `SlateDbOptions::at_url("file:///path")` | `--object-store file:///path`          | the same thing, as a URL      |
 | `SlateDbOptions::at_url("s3://bucket/prefix")` | `--object-store s3://bucket/prefix` | an S3 bucket and key prefix   |
+| `SlateDbOptions::at_object_store(client, "prefix")` | — | an object store client the application builds |
 
 `with_prefix` adds a key prefix below the one of the URL. A SlateDB database is a handful of objects
 under that prefix: do not point two databases at the same prefix.
 
 ## S3 credentials, region and endpoint
 
-Credentials never go through `SlateDbOptions`: the backend builds its S3 client with the AWS
-environment variables, exactly like the AWS CLI.
+By default the backend builds its S3 client from the AWS environment variables, exactly like the AWS
+CLI. An application that keeps its credentials elsewhere, needs a client per database, or sits
+behind a proxy builds the client itself and passes it to `SlateDbOptions::at_object_store` (see
+[A client built in code](#a-client-built-in-code)).
 
 | Variable                          | Meaning                                                     |
 | --------------------------------- | ----------------------------------------------------------- |
@@ -41,6 +44,33 @@ environment variables, exactly like the AWS CLI.
 
 S3 compatible stores use path-style addressing, which is the default, so only the endpoint, the
 region and `AWS_ALLOW_HTTP=true` are usually needed.
+
+### A client built in code
+
+`SlateDbOptions::at_object_store` takes an `object_store` client and the prefix of the database
+inside it. This is the path for everything the environment cannot express: credentials read from a
+secret manager, an endpoint or region per database instead of per process, a proxy, a timeout, or
+one client shared by several databases.
+
+```rust
+use std::sync::Arc;
+use oxigraph::store::{object_store, SlateDbOptions, Store};
+use object_store::aws::AmazonS3Builder;
+
+let client = AmazonS3Builder::new()
+    .with_bucket_name("bucket")
+    .with_region("us-east-1")
+    .with_endpoint("http://localhost:9000")
+    .with_allow_http(true)
+    .with_access_key_id(access_key)
+    .with_secret_access_key(secret_key)
+    .build()?;
+let store = Store::open_with_slate_db(SlateDbOptions::at_object_store(Arc::new(client), "db"))?;
+```
+
+The `object_store` crate is re-exported as `oxigraph::store::object_store`, so the client is built
+on the version SlateDB itself uses. The `AWS_*` variables are only read by the default path: start
+from `AmazonS3Builder::from_env()` instead of `new()` to keep them and override one setting.
 
 ### RustFS recipe
 
@@ -68,6 +98,22 @@ oxigraph load --object-store s3://oxigraph/db --file data.nq --format nq
 oxigraph serve --object-store s3://oxigraph/db
 ```
 
+### From a `.env` file
+
+The `oxigraph-s3` runner of this repository (`tools/s3-runner`) keeps the same settings in a `.env`
+file, and exports the `AWS_*` variables above from them before running the CLI:
+
+```bash
+cargo run -p oxigraph-s3-runner -- --init   # writes .env.example
+cp .env.example .env                        # then fill in the key pair
+cargo run -p oxigraph-s3-runner -- serve --bind 0.0.0.0:7878
+```
+
+It splits the endpoint into `S3_HOST`, `S3_PORT` and `S3_SCHEME`, and takes the bucket, the base
+path, the key pair and the region from `S3_BUCKET`, `S3_BASE_PATH`, `S3_ACCESS_KEY`,
+`S3_SECRET_KEY` and `S3_REGION`. `--dry-run` prints the command and the variables it would run
+with, credentials hidden.
+
 ## Object store retries
 
 SlateDB retries the transient object store errors of a foreground or background operation
@@ -80,13 +126,18 @@ object_store_max_retries = 10
 flush_interval = "100ms"
 l0_sst_size_bytes = 67108864
 max_unflushed_bytes = 268435456
-compression_codec = "lz4"
+compression_codec = "Lz4"
 ```
 
 A settings file replaces the built-in settings of the backend (100 ms flush interval, 64 MiB L0
-tables, 256 MiB of unflushed writes, LZ4 compression), so state them again. In Rust, the same file
-is read with `Settings::from_file` and handed to `SlateDbOptions::with_settings`; the type is
-re-exported as `oxigraph::store::SlateDbSettings`.
+tables, 256 MiB of unflushed writes, LZ4 compression) instead of patching them: `Settings::from_file`
+merges the file over SlateDB's own defaults, so a key left out of the file falls back to SlateDB's
+value and not the backend's. Of the four settings above, only two differ between the two sets, so a
+file that sets neither ends up with 1 GiB of unflushed writes and no compression at all. State them
+again. Values are spelled like the Rust types, hence `"Lz4"` and not `"lz4"`. Unknown keys, typos
+included, are silently ignored rather than reported, so a misspelt option leaves the store on its
+default. In Rust, the same file is read with `Settings::from_file` and handed to
+`SlateDbOptions::with_settings`; the type is re-exported as `oxigraph::store::SlateDbSettings`.
 
 ## Read-only access
 
@@ -113,6 +164,23 @@ rest, raise the `garbage_collector_options` ages above the lifetime of your read
   moving LSM tree, not a snapshot of a database.
 * Bucket versioning plus cross-region replication is the durability story for a real deployment, and
   the `backup` operation the point-in-time one. Oxigraph does not implement replication itself.
+
+The cost of `Wal` durability depends on `flush_interval`, because a commit waits for the next
+write-ahead-log flush. Measured on the machine of the
+[performance page](../planning/slatedb/performance.md), reproducibly with
+`cargo test -p oxigraph --features slatedb --test store_slatedb --release -- --ignored --nocapture
+measure_commit_latency_by_flush_interval`:
+
+| `flush_interval` | 20 single-quad commits | one commit of 10 000 quads |
+| --- | --- | --- |
+| 100 ms (default) | 101 ms per commit | 131 ms |
+| 20 ms | 21.3 ms per commit | 99 ms |
+| 5 ms | 6.1 ms per commit | 94 ms |
+| 1 ms | 2.1 ms per commit | 79 ms |
+
+Batch the writes of a workload into one commit (`Store::extend`, the bulk loader, one transaction)
+before shortening the interval: batching removes the wait from the critical path of every quad,
+while a shorter interval multiplies the write-ahead-log objects the object store has to keep.
 
 ## Behaviour changes against the RocksDB backend
 
@@ -164,22 +232,24 @@ The same workloads on the same machine, RocksDB against SlateDB (details and the
 
 | workload | RocksDB | SlateDB |
 | --- | --- | --- |
-| 100 `Store::insert`, `Wal` durability | 1.63 ms | 10.12 s |
-| 100 `Store::insert`, `Process` durability | 1.63 ms | 2.87 ms |
-| `Store::extend` of 10 000 quads | 46.4 ms | 121 ms |
-| atomic bulk load of 100 000 quads | 406 ms | 968 ms |
-| non atomic bulk load of 100 000 quads | 406 ms | 731 ms |
-| 1 000 point lookups (`Store::contains`) | 1.83 ms | 17.5 ms |
-| scan returning 100 of 1 000 quads | 363 µs | 3.68 ms |
-| 3 SPARQL queries over 1 000 quads | 3.88 ms | 36.1 ms |
-| `clear_graph` of a 100 000 quad named graph | 2.25 s | 2.35 s |
-| cold reopen of a 100 000 quad store | 47.1 ms | 449 ms |
+| 100 `Store::insert`, `Wal` durability | 1.33 ms | 10.12 s |
+| 100 `Store::insert`, `Process` durability | 1.33 ms | 2.83 ms |
+| `Store::extend` of 10 000 quads | 45.8 ms | 129 ms |
+| atomic bulk load of 100 000 quads | 399 ms | 981 ms |
+| non atomic bulk load of 100 000 quads | 399 ms | 701 ms |
+| 1 000 point lookups (`Store::contains`) | 1.77 ms | 3.04 ms |
+| scan returning 100 of 1 000 quads | 351 µs | 121 µs |
+| 3 SPARQL queries over 1 000 quads | 3.97 ms | 1.55 ms |
+| `clear_graph` of a 100 000 quad named graph | 2.17 s | 2.19 s |
+| cold reopen of a 100 000 quad store | 47.2 ms | 457 ms |
 
-No workload is faster with SlateDB, which is why RocksDB stays the default backend. The costs are
-the expected price of an LSM tree on top of an object store abstraction: one durable flush per
-commit when `Wal` durability is asked for (101 ms against 16 µs per single-insert commit, removed by
-`Process` durability), one round trip per point lookup, no SST ingestion for bulk loads, and a
-manifest replay at startup. The list of known bottlenecks is in the performance page.
+RocksDB stays the default backend because it wins every write and startup workload: SlateDB pays
+one durable flush per commit when `Wal` durability is asked for (101 ms against 13 µs per
+single-insert commit, removed by `Process` durability), has no SST ingestion for bulk loads, and
+replays its manifest at startup. The read path is the other way round, since a lookup no longer pays
+a scheduling hop and the dictionary lookups are cached: a point lookup is 1.7 times faster than with
+RocksDB, a 100-result scan 2.9 times and the SPARQL mix 2.6 times. The measurements and the known
+bottlenecks are in the performance page.
 
 The object store bill follows: a bulk load costs about 0.075 write and 0.081 read request per loaded
 quad on a local filesystem, and every commit that waits for its WAL is a request too. Bucket

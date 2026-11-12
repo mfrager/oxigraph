@@ -13,6 +13,19 @@ Scope, as agreed with the request:
 * every claim below is a measurement on this tree, and every item ends with a number to reproduce
   or a decision to record. **No speedup is claimed without a number in `performance.md`.**
 
+## 0. Status
+
+O1, O2 and O5 are implemented; O3 and O4 are not. The numbers live in `performance.md` §"The bridge
+and the dictionary cache (O1 and O2)" and §"Benchmark table".
+
+| item | state | outcome |
+| --- | --- | --- |
+| O1 | **shipped, with one deviation** | 1 000 point lookups 17.5 ms → 3.04 ms, 100-result scan 3.68 ms → 121 µs, SPARQL mix 36.1 ms → 1.55 ms. The opening path keeps a worker: `Db::build` measured 351–364 ms on a worker against 549–771 ms through `Handle::block_on` (it yields per object it replays), so `RuntimeBridge::run_on_worker` exists for it and the cold open stays at 457 ms. |
+| O2 | **shipped** | `Id2StrCache`: 16 384 entries, `DashMap` keyed by `StrHash`, one per store and shared by every reader. Eviction removes an arbitrary entry looked up in its own statement, otherwise the `iter()` guard deadlocks the `remove` on the same shard. |
+| O3 | **not enabled** | the `foyer` feature is still off; it needs an explicit go-ahead and a measured memory delta before it is added. |
+| O4 | **not implemented** | its gate (≥ 20 % of scan time in `id2str` gets over an object store) cannot be evaluated without the S3/RustFS numbers that do not exist yet, and on a local filesystem the scan is already faster than RocksDB. |
+| O5 | **shipped** | ignored `measure_commit_latency_by_flush_interval` test, 101 / 21.3 / 6.1 / 2.1 ms per single-quad commit at 100 / 20 / 5 / 1 ms; the table is in `docs/slatedb.md` and bottleneck 1 here. Default durability and interval unchanged. |
+
 ## 1. Where the time goes today
 
 Re-run of the phase 3 benchmark on the Phase 5 tree, same machine as `performance.md` (i7-6700HQ,
@@ -417,19 +430,22 @@ are judged against O1 + O2.
 
 ## 7. Exit criteria
 
-- [ ] O1 merged: bridge tests pass on both paths, and `performance.md` shows the new point-lookup
+- [x] O1 merged: bridge tests pass on both paths, and `performance.md` shows the new point-lookup
       and scan numbers with the same benchmark command.
-- [ ] O2 merged: bounded cache with unit tests, `get_str` hit path measured, and the scan/SPARQL
+- [x] O2 merged: bounded cache with unit tests, `get_str` hit path measured, and the scan/SPARQL
       numbers re-measured with the cache on.
 - [ ] O3 decided: either the `foyer` feature is enabled with a measured read win and the RSS delta
-      documented, or the measurement and its "no" are recorded in `performance.md`.
+      documented, or the measurement and its "no" are recorded in `performance.md`. **Open**: the
+      feature is unchanged pending that decision; `performance.md` records that it is off and why.
 - [ ] O4 decided: shipped with a measured object-store win ≥ 10 %, or rejected with the measured
-      share of `id2str` gets below the gate.
-- [ ] O5 published: the `flush_interval` table is in `docs/slatedb.md` and bottleneck 1 of
+      share of `id2str` gets below the gate. **Open**: not measurable on a local filesystem.
+- [x] O5 published: the `flush_interval` table is in `docs/slatedb.md` and bottleneck 1 of
       `performance.md`, and the default durability is still `Wal` at 100 ms.
-- [ ] `docs/slatedb.md` and `performance.md` tables are from **one** post-change run, not a mix of
+- [x] `docs/slatedb.md` and `performance.md` tables are from **one** post-change run, not a mix of
       old and new numbers.
-- [ ] Full verification set above is green, the RDF encoding and the `Storage`/`Store` API are
-      unchanged, and RocksDB is still the default backend.
-- [ ] `planning/slatedb/implementation_plan2.md` §11 is updated where an item retires a listed risk
+- [x] Full verification set above is green (`--lib` 54, `store_slatedb` 31 + 5 ignored,
+      `slatedb_faults` 5 + 1 ignored, `store` 26, doctests 63, clippy and `RUSTDOCFLAGS=-D warnings`
+      doc), the RDF encoding and the `Storage`/`Store` API are unchanged, and RocksDB is still the
+      default backend.
+- [x] `planning/slatedb/implementation_plan2.md` §11 is updated where an item retires a listed risk
       (the "per-scan bridge overhead" row is the first one O1 closes).
